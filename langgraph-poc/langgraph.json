@@ -1,0 +1,15 @@
+{
+    "dependencies": [
+        "langchain_core",
+        "langchain_openai",
+        "langgraph"
+    ],
+    "graphs": {
+        "simple_agent": "./simple_agent.py:app",
+        "simple_agent_prebuilt": "./simple_agent_prebuilt.py:agent",
+        "advanced_agent": "./advanced_agent.py:agent",
+        "multi_agent": "./multi_agent_system.py:agent",
+        "streaming": "./streaming_breakpoints.py:agent"
+    },
+    "env": "./.env"
+} 

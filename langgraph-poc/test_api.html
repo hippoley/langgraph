@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LangGraph API 测试工具</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+            color: #333;
+            background-color: #f9f9f9;
+        }
+        h1, h2, h3 {
+            color: #2c3e50;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #eee;
+        }
+        .container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+        .panel {
+            flex: 1;
+            min-width: 300px;
+            background-color: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+        }
+        button {
+            background-color: #4CAF50;
+            border: none;
+            color: white;
+            padding: 10px 20px;
+            text-align: center;
+            text-decoration: none;
+            display: inline-block;
+            font-size: 16px;
+            margin: 10px 5px;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: background-color 0.3s;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        button.secondary {
+            background-color: #3498db;
+        }
+        button.secondary:hover {
+            background-color: #2980b9;
+        }
+        button.danger {
+            background-color: #e74c3c;
+        }
+        button.danger:hover {
+            background-color: #c0392b;
+        }
+        pre {
+            background-color: #f5f5f5;
+            padding: 15px;
+            border-radius: 4px;
+            overflow-x: auto;
+            border-left: 4px solid #4CAF50;
+            margin: 15px 0;
+        }
+        .error {
+            color: #e74c3c;
+            border-left-color: #e74c3c;
+        }
+        .success {
+            color: #2ecc71;
+            border-left-color: #2ecc71;
+        }
+        .warning {
+            color: #f39c12;
+            border-left-color: #f39c12;
+        }
+        .status {
+            display: inline-block;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-weight: bold;
+            margin-left: 10px;
+        }
+        .status.online {
+            background-color: #2ecc71;
+            color: white;
+        }
+        .status.offline {
+            background-color: #e74c3c;
+            color: white;
+        }
+        .input-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input, select, textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+            font-family: inherit;
+            font-size: 16px;
+        }
+        .card {
+            border: 1px solid #eee;
+            border-radius: 4px;
+            padding: 15px;
+            margin-bottom: 15px;
+            background-color: #fff;
+            transition: transform 0.2s;
+        }
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        .footer {
+            text-align: center;
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid #eee;
+            color: #7f8c8d;
+        }
+        .tabs {
+            display: flex;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #ddd;
+        }
+        .tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+        }
+        .tab.active {
+            border-bottom: 2px solid #4CAF50;
+            font-weight: bold;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        .graph-list {
+            list-style: none;
+            padding: 0;
+        }
+        .graph-item {
+            padding: 10px;
+            margin-bottom: 5px;
+            background-color: #f5f5f5;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .graph-item:hover {
+            background-color: #e9e9e9;
+        }
+        .chat-container {
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            height: 400px;
+        }
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 15px;
+            background-color: #f9f9f9;
+        }
+        .chat-input {
+            display: flex;
+            padding: 10px;
+            background-color: white;
+            border-top: 1px solid #ddd;
+        }
+        .chat-input input {
+            flex: 1;
+            margin-right: 10px;
+        }
+        .message {
+            margin-bottom: 15px;
+            max-width: 80%;
+        }
+        .message.user {
+            margin-left: auto;
+            background-color: #dcf8c6;
+            padding: 10px;
+            border-radius: 10px 10px 0 10px;
+        }
+        .message.bot {
+            background-color: white;
+            padding: 10px;
+            border-radius: 10px 10px 10px 0;
+            border: 1px solid #ddd;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>LangGraph API 测试工具</h1>
+        <p>用于测试 LangGraph API 连接和功能的简易工具</p>
+        <div>
+            API 状态: <span id="apiStatus" class="status offline">检查中...</span>
+        </div>
+    </div>
+    
+    <div class="tabs">
+        <div class="tab active" data-tab="connection">连接测试</div>
+        <div class="tab" data-tab="graphs">图列表</div>
+        <div class="tab" data-tab="chat">聊天测试</div>
+        <div class="tab" data-tab="troubleshoot">故障排除</div>
+    </div>
+    
+    <div class="tab-content active" id="connection-tab">
+        <div class="container">
+            <div class="panel">
+                <h2>API 连接测试</h2>
+                <p>测试与 LangGraph API 服务器的连接是否正常。</p>
+                
+                <div class="input-group">
+                    <label for="apiUrl">API URL</label>
+                    <input type="text" id="apiUrl" value="http://127.0.0.1:2024" />
+                </div>
+                
+                <button id="testApi">测试 API 连接</button>
+                <button id="testCors" class="secondary">测试 CORS 支持</button>
+                
+                <h3>结果：</h3>
+                <pre id="connectionResult">点击按钮测试 API 连接...</pre>
+            </div>
+            
+            <div class="panel">
+                <h2>API 端点测试</h2>
+                <p>测试特定的 API 端点。</p>
+                
+                <div class="input-group">
+                    <label for="endpoint">端点</label>
+                    <select id="endpoint">
+                        <option value="/health">健康检查 (/health)</option>
+                        <option value="/v1/graphs">获取图列表 (/v1/graphs)</option>
+                        <option value="/docs">API 文档 (/docs)</option>
+                    </select>
+                </div>
+                
+                <button id="testEndpoint">测试端点</button>
+                
+                <h3>结果：</h3>
+                <pre id="endpointResult">选择端点并点击测试...</pre>
+            </div>
+        </div>
+    </div>
+    
+    <div class="tab-content" id="graphs-tab">
+        <div class="container">
+            <div class="panel">
+                <h2>可用图列表</h2>
+                <p>获取并显示所有可用的图。</p>
+                
+                <button id="refreshGraphs">刷新图列表</button>
+                
+                <div id="graphsContainer">
+                    <p>点击刷新按钮获取图列表...</p>
+                </div>
+            </div>
+            
+            <div class="panel">
+                <h2>图详情</h2>
+                <p>选择左侧的图查看详情。</p>
+                
+                <div id="graphDetails">
+                    <p>未选择图...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="tab-content" id="chat-tab">
+        <div class="container">
+            <div class="panel">
+                <h2>与图交互</h2>
+                <p>选择一个图并发送消息进行交互。</p>
+                
+                <div class="input-group">
+                    <label for="chatGraph">选择图</label>
+                    <select id="chatGraph">
+                        <option value="">-- 请选择图 --</option>
+                    </select>
+                </div>
+                
+                <div class="chat-container">
+                    <div class="chat-messages" id="chatMessages">
+                        <div class="message bot">请选择一个图并开始对话...</div>
+                    </div>
+                    <div class="chat-input">
+                        <input type="text" id="chatInput" placeholder="输入消息..." disabled />
+                        <button id="sendMessage" disabled>发送</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="tab-content" id="troubleshoot-tab">
+        <div class="container">
+            <div class="panel">
+                <h2>常见问题解决方案</h2>
+                
+                <div class="card">
+                    <h3>无法连接到 API</h3>
+                    <p>如果无法连接到 API，请检查：</p>
+                    <ul>
+                        <li>确保 LangGraph 服务器正在运行（使用 <code>langgraph dev</code> 或 <code>启动带CORS支持的LangGraph.bat</code>）</li>
+                        <li>检查服务器是否在正确的端口上运行（默认为 2024）</li>
+                        <li>确保没有防火墙阻止连接</li>
+                    </ul>
+                </div>
+                
+                <div class="card">
+                    <h3>CORS 错误</h3>
+                    <p>如果遇到 CORS 错误，请尝试：</p>
+                    <ul>
+                        <li>使用 <code>启动带CORS支持的LangGraph.bat</code> 启动服务器</li>
+                        <li>确保环境变量 <code>LANGGRAPH_API_CORS_ALLOW_ORIGINS</code> 设置为 "*"</li>
+                        <li>尝试使用不同的浏览器</li>
+                    </ul>
+                </div>
+                
+                <div class="card">
+                    <h3>图无法加载</h3>
+                    <p>如果图无法加载，请检查：</p>
+                    <ul>
+                        <li>确保 <code>langgraph.json</code> 文件配置正确</li>
+                        <li>检查 Python 文件中的图是否正确导出</li>
+                        <li>查看服务器日志是否有错误信息</li>
+                    </ul>
+                </div>
+                
+                <div class="card">
+                    <h3>替代方案</h3>
+                    <p>如果 Web 界面仍然无法工作，可以尝试：</p>
+                    <ul>
+                        <li>直接访问 <a href="http://127.0.0.1:2024/docs" target="_blank">API 文档</a></li>
+                        <li>直接运行 Python 文件：<code>python simple_agent.py</code></li>
+                        <li>使用 <code>curl</code> 或 Postman 等工具直接与 API 交互</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="footer">
+        <p>LangGraph API 测试工具 | 基于 LangGraph 和 LangChain</p>
+    </div>
+    
+    <script>
+        // 切换标签页
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', () => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                
+                tab.classList.add('active');
+                document.getElementById(`${tab.dataset.tab}-tab`).classList.add('active');
+            });
+        });
+        
+        // API 基础 URL
+        const getApiUrl = () => document.getElementById('apiUrl').value.trim();
+        
+        // 检查 API 状态
+        async function checkApiStatus() {
+            const statusElement = document.getElementById('apiStatus');
+            try {
+                const response = await fetch(`${getApiUrl()}/health`, { method: 'GET' });
+                if (response.ok) {
+                    statusElement.textContent = '在线';
+                    statusElement.className = 'status online';
+                } else {
+                    statusElement.textContent = '错误';
+                    statusElement.className = 'status offline';
+                }
+            } catch (error) {
+                statusElement.textContent = '离线';
+                statusElement.className = 'status offline';
+            }
+        }
+        
+        // 初始检查
+        checkApiStatus();
+        
+        // 测试 API 连接
+        document.getElementById('testApi').addEventListener('click', async () => {
+            const resultElement = document.getElementById('connectionResult');
+            resultElement.textContent = '正在测试 API 连接...';
+            resultElement.className = '';
+            
+            try {
+                const response = await fetch(`${getApiUrl()}/health`);
+                const data = await response.json();
+                
+                resultElement.textContent = JSON.stringify(data, null, 2);
+                resultElement.className = 'success';
+                checkApiStatus();
+            } catch (error) {
+                resultElement.textContent = `错误: ${error.message}`;
+                resultElement.className = 'error';
+                checkApiStatus();
+            }
+        });
+        
+        // 测试 CORS 支持
+        document.getElementById('testCors').addEventListener('click', async () => {
+            const resultElement = document.getElementById('connectionResult');
+            resultElement.textContent = '正在测试 CORS 支持...';
+            resultElement.className = '';
+            
+            try {
+                const response = await fetch(`${getApiUrl()}/health`, {
+                    method: 'GET',
+                    headers: {
+                        'Origin': 'http://example.com'
+                    }
+                });
+                
+                const corsHeader = response.headers.get('Access-Control-Allow-Origin');
+                
+                if (corsHeader) {
+                    resultElement.textContent = `CORS 支持正常!\nAccess-Control-Allow-Origin: ${corsHeader}`;
+                    resultElement.className = 'success';
+                } else {
+                    resultElement.textContent = `CORS 可能未正确配置。未找到 Access-Control-Allow-Origin 头。`;
+                    resultElement.className = 'warning';
+                }
+            } catch (error) {
+                resultElement.textContent = `错误: ${error.message}`;
+                resultElement.className = 'error';
+            }
+        });
+        
+        // 测试特定端点
+        document.getElementById('testEndpoint').addEventListener('click', async () => {
+            const endpoint = document.getElementById('endpoint').value;
+            const resultElement = document.getElementById('endpointResult');
+            
+            resultElement.textContent = `正在测试端点 ${endpoint}...`;
+            resultElement.className = '';
+            
+            try {
+                const response = await fetch(`${getApiUrl()}${endpoint}`);
+                
+                if (endpoint === '/docs') {
+                    if (response.ok) {
+                        resultElement.textContent = `API 文档可访问。状态码: ${response.status}`;
+                        resultElement.className = 'success';
+                    } else {
+                        resultElement.textContent = `API 文档不可访问。状态码: ${response.status}`;
+                        resultElement.className = 'error';
+                    }
+                } else {
+                    const data = await response.json();
+                    resultElement.textContent = JSON.stringify(data, null, 2);
+                    resultElement.className = 'success';
+                }
+            } catch (error) {
+                resultElement.textContent = `错误: ${error.message}`;
+                resultElement.className = 'error';
+            }
+        });
+        
+        // 获取图列表
+        async function fetchGraphs() {
+            const container = document.getElementById('graphsContainer');
+            const chatGraphSelect = document.getElementById('chatGraph');
+            
+            container.innerHTML = '<p>正在获取图列表...</p>';
+            
+            try {
+                const response = await fetch(`${getApiUrl()}/v1/graphs`);
+                const data = await response.json();
+                
+                if (data.graphs && data.graphs.length > 0) {
+                    let html = '<ul class="graph-list">';
+                    
+                    // 清空选择框
+                    chatGraphSelect.innerHTML = '<option value="">-- 请选择图 --</option>';
+                    
+                    data.graphs.forEach(graph => {
+                        html += `<li class="graph-item" data-id="${graph.id}">${graph.id}</li>`;
+                        
+                        // 添加到聊天选择框
+                        const option = document.createElement('option');
+                        option.value = graph.id;
+                        option.textContent = graph.id;
+                        chatGraphSelect.appendChild(option);
+                    });
+                    
+                    html += '</ul>';
+                    container.innerHTML = html;
+                    
+                    // 添加点击事件
+                    document.querySelectorAll('.graph-item').forEach(item => {
+                        item.addEventListener('click', () => {
+                            fetchGraphDetails(item.dataset.id);
+                        });
+                    });
+                } else {
+                    container.innerHTML = '<p>未找到可用的图。</p>';
+                }
+            } catch (error) {
+                container.innerHTML = `<p class="error">获取图列表失败: ${error.message}</p>`;
+            }
+        }
+        
+        // 获取图详情
+        async function fetchGraphDetails(graphId) {
+            const detailsContainer = document.getElementById('graphDetails');
+            
+            detailsContainer.innerHTML = `<p>正在获取 "${graphId}" 的详情...</p>`;
+            
+            try {
+                const response = await fetch(`${getApiUrl()}/v1/graphs/${graphId}`);
+                const data = await response.json();
+                
+                let html = `<h3>${graphId}</h3>`;
+                
+                if (data.config) {
+                    html += `<p><strong>配置:</strong></p>`;
+                    html += `<pre>${JSON.stringify(data.config, null, 2)}</pre>`;
+                }
+                
+                detailsContainer.innerHTML = html;
+            } catch (error) {
+                detailsContainer.innerHTML = `<p class="error">获取图详情失败: ${error.message}</p>`;
+            }
+        }
+        
+        // 刷新图列表
+        document.getElementById('refreshGraphs').addEventListener('click', fetchGraphs);
+        
+        // 聊天功能
+        let chatThreadId = null;
+        
+        document.getElementById('chatGraph').addEventListener('change', function() {
+            const graphId = this.value;
+            const chatInput = document.getElementById('chatInput');
+            const sendButton = document.getElementById('sendMessage');
+            const messagesContainer = document.getElementById('chatMessages');
+            
+            if (graphId) {
+                chatInput.disabled = false;
+                sendButton.disabled = false;
+                chatThreadId = null;
+                
+                // 清空聊天记录
+                messagesContainer.innerHTML = `<div class="message bot">已选择图 "${graphId}"，开始对话...</div>`;
+            } else {
+                chatInput.disabled = true;
+                sendButton.disabled = true;
+                messagesContainer.innerHTML = '<div class="message bot">请选择一个图并开始对话...</div>';
+            }
+        });
+        
+        document.getElementById('sendMessage').addEventListener('click', sendChatMessage);
+        document.getElementById('chatInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendChatMessage();
+            }
+        });
+        
+        async function sendChatMessage() {
+            const graphId = document.getElementById('chatGraph').value;
+            const inputElement = document.getElementById('chatInput');
+            const messagesContainer = document.getElementById('chatMessages');
+            const message = inputElement.value.trim();
+            
+            if (!message) return;
+            
+            // 添加用户消息
+            messagesContainer.innerHTML += `<div class="message user">${message}</div>`;
+            inputElement.value = '';
+            
+            // 滚动到底部
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            
+            try {
+                // 创建线程（如果需要）
+                if (!chatThreadId) {
+                    const threadResponse = await fetch(`${getApiUrl()}/v1/threads`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
+                    const threadData = await threadResponse.json();
+                    chatThreadId = threadData.thread_id;
+                }
+                
+                // 发送消息
+                messagesContainer.innerHTML += `<div class="message bot">正在思考...</div>`;
+                
+                const response = await fetch(`${getApiUrl()}/v1/graphs/${graphId}/runs`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        thread_id: chatThreadId,
+                        input: {
+                            messages: [
+                                {
+                                    type: "human",
+                                    content: message
+                                }
+                            ]
+                        }
+                    })
+                });
+                
+                const data = await response.json();
+                
+                // 移除"正在思考"消息
+                messagesContainer.removeChild(messagesContainer.lastChild);
+                
+                // 添加响应
+                if (data.output && data.output.messages) {
+                    const aiMessages = data.output.messages.filter(msg => msg.type === "ai");
+                    if (aiMessages.length > 0) {
+                        const lastMessage = aiMessages[aiMessages.length - 1];
+                        messagesContainer.innerHTML += `<div class="message bot">${lastMessage.content}</div>`;
+                    } else {
+                        messagesContainer.innerHTML += `<div class="message bot">没有收到回复。</div>`;
+                    }
+                } else {
+                    messagesContainer.innerHTML += `<div class="message bot">没有收到回复。</div>`;
+                }
+                
+                // 滚动到底部
+                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            } catch (error) {
+                // 移除"正在思考"消息（如果存在）
+                if (messagesContainer.lastChild.textContent === "正在思考...") {
+                    messagesContainer.removeChild(messagesContainer.lastChild);
+                }
+                
+                messagesContainer.innerHTML += `<div class="message bot error">错误: ${error.message}</div>`;
+                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            }
+        }
+    </script>
+</body>
+</html> 
