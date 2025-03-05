@@ -400,4 +400,48 @@ Set the following environment variables in the `.env` file:
 
 - [LangGraph Documentation](https://langchain-ai.github.io/langgraph/)
 - [LangChain Documentation](https://python.langchain.com/docs/get_started/introduction)
-- [OpenAI API Documentation](https://platform.openai.com/docs/api-reference) 
+- [OpenAI API Documentation](https://platform.openai.com/docs/api-reference)
+
+## 项目结构
+
+```
+langgraph-poc/
+├── .env                      # 环境变量配置
+├── api_config.py             # API 配置
+├── advanced_agent.py         # 高级代理示例
+├── langgraph.json            # LangGraph 配置
+├── langgraph_fix.py          # LangGraph 修复工具
+├── multi_agent_system.py     # 多代理系统示例
+├── open_test_api.bat         # 测试工具启动脚本
+├── requirements.txt          # 依赖列表
+├── simple_agent.py           # 简单代理示例
+├── simple_agent_basic.py     # 简化版代理（不依赖 LangGraph）
+├── simple_agent_prebuilt.py  # 预构建代理示例
+├── start_langgraph.bat       # 主启动脚本
+├── streaming_breakpoints.py  # 流式处理和断点示例
+└── test_api.html             # API 测试工具
+```
+
+## 快速开始
+
+### 方法 1: 使用批处理文件（推荐）
+
+1. 双击运行 `start_langgraph.bat`
+2. 在菜单中选择选项 3 启动服务器
+3. 访问 LangGraph Studio UI: https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024
+
+### 方法 2: 使用 Python 脚本
+
+您也可以直接运行 `langgraph_fix.py` 脚本:
+
+```
+python langgraph_fix.py --start
+```
+
+### 方法 3: 直接运行示例
+
+如果您只想尝试代理功能而不启动服务器，可以直接运行:
+
+```
+python simple_agent_basic.py
+``` 

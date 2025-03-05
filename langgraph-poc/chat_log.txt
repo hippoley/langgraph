@@ -1,0 +1,323 @@
+(LangGraph) PS C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\langgraph-poc>  python advanced_agent.py
+高级LangGraph智能体示例
+输入'exit'退出，输入'help'查看帮助
+智能体已准备就绪，请输入您的问题...
+
+您: help
+
+可用命令:
+- 'exit': 退出程序
+- 'memory': 显示当前记忆
+- 'intervene': 触发人类干预
+- '记住xxx': 将信息存入记忆
+- '记住key:value': 将键值对存入记忆
+
+您: 记住麦高芬
+正在处理您的消息...
+已记住信息: 麦高芬
+
+AI: 我已经记住了这个信息。
+
+您: memory     
+
+当前记忆:
+- 记忆_1741168349: 麦高芬
+
+您: 记住1：一  
+正在处理您的消息...
+已记住键值对: 1 = 一
+
+AI: 我已经记住了这个信息。
+
+您: memory     
+
+当前记忆:
+- 记忆_1741168349: 麦高芬
+- 1: 一
+
+您: intervene        
+正在请求人类干预...
+
+已请求人类干预
+
+您: 你好啊
+正在处理您的消息...
+模型调用失败: Error code: 402 - {'object': 'error', 'message': 'Not enough point. Need 362, reduce the max_tokens or the input length to lower the point usage.', 'code': 40201, 'requestId': 'af5faf3c-f9a7-11ef-8b23-525400652bc8'}
+
+AI: 抱歉，我无法处理您的请求。
+
+您: l
+正在处理您的消息...
+Traceback (most recent call last):
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\langgraph-poc\advanced_agent.py", line 324, in <module>
+    memory_state[key.strip()] = value.strip()
+ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\langgraph\pregel\__init__.py", line 2367, in invoke
+    for chunk in self.stream(
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\langgraph\pregel\__init__.py", line 2024, in stream
+    for _ in runner.tick(
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\langgraph\pregel\runner.py", line 230, in tick
+    run_with_retry(
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\langgraph\pregel\retry.py", line 40, in run_with_retry
+    return task.proc.invoke(task.input, config)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\langgraph\utils\runnable.py", line 546, in invoke
+    input = step.invoke(input, config, **kwargs)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\langgraph\utils\runnable.py", line 310, in invoke
+    ret = context.run(self.func, *args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\langgraph-poc\advanced_agent.py", line 100, in agent
+    # 为了减少API调用的token数量，只保留最近的5条消息
+         ^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\langchain_core\language_models\chat_models.py", line 285, in invoke
+    self.generate_prompt(
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\langchain_core\language_models\chat_models.py", line 861, in generate_prompt
+    return self.generate(prompt_messages, stop=stop, callbacks=callbacks, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\langchain_core\language_models\chat_models.py", line 691, in generate
+    self._generate_with_cache(
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\langchain_core\language_models\chat_models.py", line 926, in _generate_with_cache
+    result = self._generate(
+             ^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\langchain_openai\chat_models\base.py", line 800, in _generate
+    response = self.client.create(**payload)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\openai\_utils\_utils.py", line 279, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\openai\resources\chat\completions\completions.py", line 879, in create
+    return self._post(
+           ^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\openai\_base_client.py", line 1296, in post
+    return cast(ResponseT, self.request(cast_to, opts, stream=stream, stream_cls=stream_cls))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\openai\_base_client.py", line 973, in request
+    return self._request(
+           ^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\openai\_base_client.py", line 1009, in _request
+    response = self._client.send(
+               ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\httpx\_client.py", line 914, in send
+    response = self._send_handling_auth(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\httpx\_client.py", line 942, in _send_handling_auth
+    response = self._send_handling_redirects(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\httpx\_client.py", line 979, in _send_handling_redirects
+    response = self._send_single_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\httpx\_client.py", line 1014, in _send_single_request
+    response = transport.handle_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\httpx\_transports\default.py", line 250, in handle_request
+    resp = self._pool.handle_request(req)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\httpcore\_sync\connection_pool.py", line 256, in handle_request
+    raise exc from None
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\httpcore\_sync\connection_pool.py", line 236, in handle_request
+    response = connection.handle_request(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\httpcore\_sync\http_proxy.py", line 343, in handle_request
+    return self._connection.handle_request(request)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\s    raise exc
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\httpcore\_sync\http11.py", line 106, in handle_request     
+    ) = self._receive_response_headers(**kwargs)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\httpcore\_sync\http11.py", line 177, in _receive_response_headers
+    event = self._receive_event(timeout=timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\httpcore\_sync\http11.py", line 217, in _receive_event     
+    data = self._network_stream.read(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\LangGraph\Lib\site-packages\httpcore\_backends\sync.py", line 128, in read
+    return self._sock.recv(max_bytes)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\AppData\Local\Programs\Python\Python311\Lib\ssl.py", line 1263, in recv
+    return self.read(buflen)
+           ^^^^^^^^^^^^^^^^^
+  File "C:\Users\Hippo\AppData\Local\Programs\Python\Python311\Lib\ssl.py", line 1136, in read
+    return self._sslobj.read(len)
+           ^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+(LangGraph) PS C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\langgraph-poc> python advanced_agent.py
+高级LangGraph智能体示例
+输入'exit'退出，输入'help'查看帮助
+智能体已准备就绪，请输入您的问题...
+
+您: help
+
+可用命令:
+- 'exit': 退出程序
+- 'memory': 显示当前记忆
+- 'intervene': 触发人类干预
+- '记住xxx': 将信息存入记忆
+- '记住key:value': 将键值对存入记忆
+- 'clear': 清除对话历史，减少API调用量
+
+您: 记住麦高芬   
+正在处理您的消息...
+已记住信息: 麦高芬
+
+AI: 我已经记住了这个信息。
+
+您: memory     
+
+当前记忆:
+- 记忆_1741181948: 麦高芬
+
+您: 你记住了什么
+正在处理您的消息...
+已记住信息: 了什么
+
+AI: 我已经记住了这个信息。
+
+您: ？
+正在处理您的消息...
+
+AI: 我记住了你让我记住的“麦高芬”这个词。你需要关于它的进一步解释或者讨论吗？
+
+您: 麦高芬是什么
+正在处理您的消息...
+
+AI: 麦高芬（MacGuffin）是影视作品和小说中常用的一种叙事手法。它通常指的 是一个推动剧情发展的物体、事件或目标，虽然它对故事的核心意义往往并不那么重要，但却吸引着人物不断追寻或争夺，从而引发一系列情节发展。以下是关于麦高芬的一些关键点：
+
+1. 来源：这个术语最早由著名导演阿尔弗雷德·希区柯克推广，他在多部电影中使用这一概念。希区柯克常常强调，观众更多的是关注人物的行为和情感，而麦高芬本身却只是引发这些行为的触发点。
+
+2. 特点：
+   - 推动情节：麦高芬通常是故事中各方争夺的目标，其实际内容可能并不重要 ，关键在于它推动了人物之间的冲突和情节发展。
+   - 引导角色行为：剧中人物为获得或保护麦高芬而展开行动，这种行动进而揭 示了人物性格和关系。
+   - 观众的关注点：观众往往更关注人物的情感变化和行为，而对于麦高芬本身 的性质可能并不深究，只要它足以带动故事进展。
+
+3. 举例说明：
+   - 在经典电影《北北西》中，一个看似普通的文件实际上成为了男主角卷入间 谍活动的触发点，但文件的具体内容并非故事的核心。
+   - 在其他作品中，麦高芬可能是某个神秘的宝物、绝密文件或者其他吸引众人 争夺的物品，但它的实际意义和背景信息可能非常模糊或甚至无关紧要。        
+
+总体来说，麦高芬更多地是一种叙事工具，帮助构建悬念、推动情节发展，同时也让故事中的人物在追逐过程中展现出各自的个性和冲突。
+
+您: memory
+
+当前记忆:
+- 记忆_1741181948: 麦高芬
+- 记忆_1741181971: 了什么
+
+您: help
+
+可用命令:
+- 'exit': 退出程序
+- 'memory': 显示当前记忆
+- 'intervene': 触发人类干预
+- '记住xxx': 将信息存入记忆
+- '记住key:value': 将键值对存入记忆
+- 'clear': 清除对话历史，减少API调用量
+
+您: intervene
+正在请求人类干预...
+
+AI: 你刚才的输入似乎没有包含具体的问题或要求。请告诉我你需要什么样的帮助或讨论哪个话题？
+
+已处理人类干预
+
+您: 玄学
+正在处理您的消息...
+
+AI: “玄学”这个词在不同语境中可能具有不同的含义，下面介绍几种常见的理解和解释：
+
+1. 历史与哲学上的玄学
+   • 玄学最早起源于魏晋时期，学者们试图探讨宇宙、人生以及事物本质的“玄奥”之理。他们主要以《老子》《庄子》等道家经典为基础，同时吸收儒家思想，试 图找到一种既超越世俗俗务又能够解释现实世界奥秘的哲学路径。
+   • 魏晋玄学重视“无”（无为、无极）和“有”的统一，强调直观和体验，认为道 理往往超越语言和理性表达。这种思想影响深远，对后来的玄学、道教乃至中国传统文化都有一定影响。
+
+2. 现代语境中的玄学
+   • 在日常生活中，“玄学”有时被用来泛指一些神秘、难以捉摸、不易用科学方 法解释的现象或思想，如命理、风水、周易卜卦等。
+   • 这类玄学通常包含一些传统民俗和占卜方法，虽然在现代科学观点下缺乏实 证依据，但在部分文化和民众中仍有一定影响力。
+
+3. 两者的区别和联系
+   • 历史的玄学更多地是一种哲学思考，侧重于对宇宙和人生本质的探讨，具有 高度的抽象性和理论性；
+   • 而民间或现代语境中的玄学则更多涉及实践和应用，如风水、命理等，是一 种文化现象，其依据和实践方法往往不是严格的理论体系，而带有一定的传统习俗色彩。
+
+总体来看，无论是作为一种哲学流派还是作为一种文化现象，“玄学”都反映了人们对世界奥秘、人生意义以及自然法则的一种探索和追问。对玄学的认识和看法往往因时代、文化背景和个人信仰而有所不同。如果你对某一方面特别感兴趣，可以进一步深入探讨相关的经典著作、历史背景以及当代应用。
+
+您: 记住
+正在处理您的消息...
+已记住信息:
+
+AI: 我已经记住了这个信息。
+
+您: memory    
+
+当前记忆:
+- 记忆_1741181948: 麦高芬
+- 记忆_1741181971: 了什么
+- 记忆_1741182193:
+
+您: 记住刚刚咱们聊的内容
+正在处理您的消息...
+已记住信息: 刚刚咱们聊的内容
+
+AI: 我已经记住了这个信息。
+
+您: 你记住的东西，和我说说
+正在处理您的消息...
+已记住信息: 的东西，和我说说
+
+AI: 我已经记住了这个信息。
+
+您: Traceback (most recent call last):
+  File "C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\langgraph-poc\advanced_agent.py", line 251, in <module>
+    import random
+
+KeyboardInterrupt
+(LangGraph) PS C:\Users\Hippo\PycharmProjects\RAGFLOW\langgraph\langgraph-poc> python advanced_agent.py
+高级LangGraph智能体示例
+输入'exit'退出，输入'help'查看帮助
+智能体已准备就绪，请输入您的问题...
+
+您: help
+
+可用命令:
+- 'exit': 退出程序
+- 'memory': 显示当前记忆
+- 'intervene': 手动触发人类干预
+- 'interventions': 显示干预记录
+- '记住xxx': 将信息存入记忆
+- '记住key:value': 将键值对存入记忆
+- 'clear': 清除对话历史，减少API调用量
+
+您: 投诉
+
+检测到可能需要人类干预的内容: '投诉'
+已自动进入人类干预模式
+
+请输入干预内容，输入'end'结束干预
+
+[人类干预模式] 请输入干预内容 (输入'end'结束干预): 对不起亲亲，有什么可
+以帮您
+正在处理人类干预...
+
+AI: 你好！请问有什么我可以帮您处理或者解答的吗？
+
+干预已处理并记录
+
+您: 我要求换人工
+正在处理您的消息...
+
+AI: 您好，目前只有我这位AI助手能够为您提供服务，并没有“换人工”的功能。不过，我会尽我所能帮助您解答疑问或解决问题。请问您遇到了什么困难？我们可以一起尝试解决。
+
+您: 可恶
+正在处理您的消息...
+
+AI: 听起来您似乎有些不满或沮丧。请问是否有什么具体问题或困扰，我可以帮您解决或倾听您的诉求的？您的反馈对我很重要，我会尽力协助您。
+
+您: 记住我的三
+正在处理您的消息...
+已记住信息: 我的三
+
+AI: 我已经记住了这个信息。
+
+您: memory
+
+当前记忆:
+- 记忆_1741182346: 我的三
+
+您:

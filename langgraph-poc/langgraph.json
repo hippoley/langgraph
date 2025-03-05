@@ -11,5 +11,5 @@
         "multi_agent": "./multi_agent_system.py:agent",
         "streaming": "./streaming_breakpoints.py:agent"
     },
-    "env": "./.env"
+    "env_file": "./.env"
 } 
