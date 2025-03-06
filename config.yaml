@@ -1,0 +1,22 @@
+log_level: INFO
+tools:
+- config:
+    api_key: your-api-key-here
+    model: gpt-3.5-turbo
+  description: 使用LLM生成文本
+  enabled: true
+  name: llm_generate_text
+  type: llm
+- config:
+    api_key: your-api-key-here
+    url: https://your-vector-db-endpoint.com
+  description: 查询向量数据库
+  enabled: true
+  name: vector_db_query
+  type: vector_db
+- config:
+    api_key: your-api-key-here
+  description: 生成图像
+  enabled: true
+  name: generate_image
+  type: image_gen
