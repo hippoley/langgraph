@@ -6,8 +6,9 @@ import os
 import json
 import logging
 import uuid
+import asyncio
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Union, TypedDict, Literal, Annotated
+from typing import Dict, List, Any, Optional, Union, TypedDict, Literal, Annotated, AsyncIterator
 from dataclasses import dataclass, field, asdict
 
 # 配置日志
@@ -22,7 +23,7 @@ try:
     from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
     from langchain_openai import ChatOpenAI
     from langgraph.graph import StateGraph, END
-    from langgraph.checkpoint import MemorySaver
+    from langgraph.checkpoint import MemorySaver, SQLiteSaver, Checkpointer
     from intent_manager import IntentManager, Intent, Slot, IntentState
     from business_metrics import BusinessMetricRegistry, create_default_metrics
     from enhanced_rag import EnhancedRetriever, RetrievalResult, create_sample_knowledge_base
@@ -31,6 +32,37 @@ except ImportError as e:
     logger.error(f"导入依赖失败: {str(e)}")
     logger.error("请确保已安装所有必要的依赖")
     raise
+
+# 持久化配置
+PERSISTENCE_TYPE = os.getenv("PERSISTENCE_TYPE", "memory")  # memory, sqlite, postgres
+SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "agent_states/sessions.db")
+POSTGRES_CONN_STRING = os.getenv("POSTGRES_CONN_STRING", "")
+
+# 全局会话管理
+SESSION_STATES = {}
+
+# 获取Checkpointer实例
+def get_checkpointer():
+    """获取持久化器"""
+    if PERSISTENCE_TYPE == "memory":
+        logger.info("使用内存持久化")
+        return Checkpointer(MemorySaver())
+    elif PERSISTENCE_TYPE == "sqlite":
+        logger.info(f"使用SQLite持久化: {SQLITE_DB_PATH}")
+        # 确保目录存在
+        os.makedirs(os.path.dirname(SQLITE_DB_PATH), exist_ok=True)
+        return Checkpointer(SQLiteSaver(SQLITE_DB_PATH))
+    elif PERSISTENCE_TYPE == "postgres" and POSTGRES_CONN_STRING:
+        logger.info("使用PostgreSQL持久化")
+        try:
+            from langgraph.checkpoint.postgres import PostgresSaver
+            return Checkpointer(PostgresSaver(POSTGRES_CONN_STRING))
+        except ImportError:
+            logger.warning("未安装PostgreSQL支持，回退到SQLite")
+            return Checkpointer(SQLiteSaver(SQLITE_DB_PATH))
+    else:
+        logger.warning(f"未知的持久化类型: {PERSISTENCE_TYPE}，回退到内存")
+        return Checkpointer(MemorySaver())
 
 # 对话状态定义
 class EnhancedAgentState(TypedDict):
@@ -49,16 +81,20 @@ class EnhancedAgentState(TypedDict):
     
     # 知识和检索
     retrieval_results: List[Dict[str, Any]]   # 检索结果
-    context: Dict[str, Any]                  # 上下文信息
     
-    # 业务数据
-    business_data: Optional[Dict[str, Any]]   # 业务数据
+    # 流程控制
+    status: str                  # 当前状态
+    next_step: str               # 下一步
+    error: Optional[str]         # 错误信息
     
-    # 控制标志
-    status: str                   # 状态标志
-    error: Optional[str]          # 错误信息
-    should_continue: bool         # 是否继续
-    human_intervention: bool      # 是否需要人工干预
+    # 断点和人机交互
+    breakpoints: Dict[str, bool]  # 断点设置
+    human_input_required: bool    # 是否需要人工输入
+    human_input: Optional[str]    # 人工输入
+    confidence: float             # 置信度
+    
+    # 业务指标
+    business_metrics: Dict[str, Any]  # 业务指标
 
 # 工具定义
 class Tools:
@@ -185,12 +221,14 @@ def initialize_state() -> EnhancedAgentState:
         suspended_intents=[],
         slots={},
         retrieval_results=[],
-        context={},
-        business_data=None,
         status="initialized",
+        next_step="",
         error=None,
-        should_continue=True,
-        human_intervention=False
+        breakpoints={},
+        human_input_required=False,
+        human_input=None,
+        confidence=0.0,
+        business_metrics={}
     )
 
 # 注册预定义意图
@@ -1621,9 +1659,30 @@ def build_graph():
     # 添加状态更新节点
     graph.add_node("update_state", update_state)
     
+    # 添加断点和人机交互节点
+    graph.add_node("check_pause", lambda state: state)  # 检查断点
+    graph.add_node("handle_breakpoint", handle_breakpoint)  # 处理断点
+    graph.add_node("process_human_input", process_human_input)  # 处理人工输入
+    
     # 添加条件边
-    # 起始 -> 用户输入处理
-    graph.set_entry_point("user_input_processor")
+    # 起始 -> 检查断点
+    graph.set_entry_point("check_pause")
+    
+    # 检查断点 -> 路由
+    graph.add_conditional_edges(
+        "check_pause",
+        {
+            "handle_breakpoint": should_pause,
+            "process_human_input": lambda state: state.get("human_input") is not None,
+            "user_input_processor": lambda state: True  # 默认情况
+        }
+    )
+    
+    # 处理断点 -> 结束
+    graph.add_edge("handle_breakpoint", END)
+    
+    # 处理人工输入 -> 检查断点
+    graph.add_edge("process_human_input", "check_pause")
     
     # 用户输入处理 -> 检查返回
     graph.add_edge("user_input_processor", "check_return_to_previous")
@@ -1634,7 +1693,6 @@ def build_graph():
     # 意图识别 -> 路由
     graph.add_conditional_edges(
         "intent_recognizer",
-        router,
         {
             "slot_filler": lambda state: state.get("current_intent") and state.get("status") != "slots_filled",
             "calculator_handler": lambda state: state.get("current_intent", {}).get("name") == "calculate" and state.get("status") == "slots_filled",
@@ -1653,7 +1711,6 @@ def build_graph():
     # 槽位填充 -> 路由
     graph.add_conditional_edges(
         "slot_filler",
-        router,
         {
             "slot_filler": lambda state: state.get("status") == "slot_filling",
             "calculator_handler": lambda state: state.get("current_intent", {}).get("name") == "calculate" and state.get("status") == "slots_filled",
@@ -1678,11 +1735,13 @@ def build_graph():
     for handler in handlers:
         graph.add_edge(handler, "update_state")
     
-    # 状态更新 -> 结束
-    graph.add_edge("update_state", END)
+    # 主线处理完成后 -> 检查断点
+    graph.add_edge("update_state", "check_pause")
     
-    # 编译图
-    return graph.compile()
+    # 知识检索器添加
+    graph.add_edge("knowledge_retriever", "update_state")
+    
+    return graph
 
 # 创建图
 compiled_graph = build_graph()
@@ -1690,40 +1749,283 @@ compiled_graph = build_graph()
 # 创建内存保存器
 memory_saver = MemorySaver()
 
-# 设置入口函数
-def process_message(session_id: str, message: str):
-    """处理用户消息"""
-    try:
-        # 获取或初始化状态
-        try:
-            state = compiled_graph.get_state(session_id)
-            logger.info(f"加载会话: {session_id}")
-        except:
-            state = initialize_state()
-            state["session_id"] = session_id
-            logger.info(f"初始化新会话: {session_id}")
+# 获取异步LLM
+def get_async_llm(temperature=0):
+    """获取异步LLM实例"""
+    # 获取环境变量
+    api_key = os.getenv("OPENAI_API_KEY", "fk222719-4TlnHx5wbaXtUm4CcneT1oLogM3TKGDB")
+    api_base = os.getenv("OPENAI_API_BASE", "https://oa.api2d.net")
+    model_name = os.getenv("OPENAI_MODEL_NAME", "o3-mini")
+    
+    # 创建异步LLM实例
+    llm = ChatOpenAI(
+        model=model_name,
+        temperature=temperature,
+        openai_api_key=api_key,
+        openai_api_base=api_base,
+        streaming=True  # 启用流式处理
+    )
+    
+    return llm
+
+# 断点检查函数
+def should_pause(state: EnhancedAgentState) -> bool:
+    """检查是否需要暂停执行"""
+    # 检查断点设置
+    if state["breakpoints"].get(state["status"], False):
+        logger.info(f"触发断点: {state['status']}")
+        return True
+    
+    # 检查置信度
+    if state["confidence"] < 0.7 and state.get("status") not in ["waiting_for_human", "processing_human_input"]:
+        logger.info(f"置信度低于阈值: {state['confidence']}")
+        return True
+    
+    return False
+
+# 处理断点函数
+def handle_breakpoint(state: EnhancedAgentState) -> EnhancedAgentState:
+    """处理断点状态"""
+    # 复制状态
+    new_state = state.copy()
+    
+    # 设置等待人工输入标志
+    new_state["human_input_required"] = True
+    new_state["status"] = "waiting_for_human"
+    
+    # 添加系统消息
+    new_state["messages"].append({
+        "role": "system",
+        "content": f"执行暂停，等待人工干预。当前状态: {state['status']}"
+    })
+    
+    return new_state
+
+# 处理人工输入函数
+def process_human_input(state: EnhancedAgentState) -> EnhancedAgentState:
+    """处理人工输入"""
+    # 复制状态
+    new_state = state.copy()
+    
+    # 检查是否有人工输入
+    if not new_state.get("human_input"):
+        return new_state
+    
+    # 处理人工输入
+    human_input = new_state["human_input"]
+    new_state["human_input"] = None
+    new_state["human_input_required"] = False
+    new_state["status"] = "processing_human_input"
+    
+    # 添加人工消息
+    new_state["messages"].append({
+        "role": "system",
+        "content": f"人工干预: {human_input}"
+    })
+    
+    # 解析指令
+    if human_input.startswith("/"):
+        parts = human_input[1:].split()
+        command = parts[0].lower() if parts else ""
         
-        # 添加用户消息
-        state["messages"].append({
-            "role": "user",
-            "content": message
+        if command == "continue":
+            # 继续执行
+            new_state["status"] = new_state.get("next_step", "user_input_processor")
+            new_state["messages"].append({
+                "role": "system",
+                "content": "继续执行流程。"
+            })
+        elif command == "retry":
+            # 重试当前步骤
+            new_state["status"] = new_state.get("next_step", "user_input_processor")
+            new_state["messages"].append({
+                "role": "system",
+                "content": "重试当前步骤。"
+            })
+        elif command == "abort":
+            # 中止当前意图
+            if new_state["current_intent"]:
+                new_state["messages"].append({
+                    "role": "system",
+                    "content": f"中止当前意图: {new_state['current_intent'].get('name')}。"
+                })
+                new_state["current_intent"] = None
+                new_state["status"] = "intent_recognizer"
+        elif command.startswith("breakpoint"):
+            # 设置断点
+            if len(parts) > 1:
+                node_name = parts[1]
+                action = parts[2] if len(parts) > 2 else "toggle"
+                
+                if action.lower() == "on":
+                    new_state["breakpoints"][node_name] = True
+                    new_state["messages"].append({
+                        "role": "system",
+                        "content": f"断点已设置: {node_name}"
+                    })
+                elif action.lower() == "off":
+                    new_state["breakpoints"][node_name] = False
+                    new_state["messages"].append({
+                        "role": "system",
+                        "content": f"断点已移除: {node_name}"
+                    })
+                else:  # toggle
+                    new_state["breakpoints"][node_name] = not new_state["breakpoints"].get(node_name, False)
+                    status = "设置" if new_state["breakpoints"][node_name] else "移除"
+                    new_state["messages"].append({
+                        "role": "system",
+                        "content": f"断点已{status}: {node_name}"
+                    })
+        else:
+            new_state["messages"].append({
+                "role": "system",
+                "content": f"未知命令: {command}"
+            })
+            new_state["status"] = "user_input_processor"
+    else:
+        # 作为普通消息处理
+        new_state["messages"].append({
+            "role": "human",
+            "content": human_input
         })
-        
-        # 执行图
-        result = compiled_graph.invoke(state, {"session_id": session_id})
-        
-        # 返回结果
-        return result
-    except Exception as e:
-        logger.error(f"处理消息时出错: {str(e)}")
-        # 返回错误消息
-        return {
-            "status": "error",
-            "error": str(e),
-            "messages": [
-                {"role": "assistant", "content": "抱歉，处理您的消息时出现错误。请稍后再试。"}
-            ]
+        new_state["status"] = "user_input_processor"
+    
+    return new_state
+
+# 异步流式处理
+async def astream_message(session_id: str, message: str) -> AsyncIterator[Dict[str, Any]]:
+    """异步流式处理消息"""
+    # 获取会话状态
+    session_state = await get_or_create_session_state(session_id)
+    
+    # 创建图实例
+    checkpointer = get_checkpointer()
+    graph = build_graph()
+    compiled_graph = graph.compile(checkpointer=checkpointer)
+    
+    # 添加用户消息
+    user_message = {"role": "human", "content": message}
+    session_state["messages"].append(user_message)
+    session_state["last_updated_at"] = datetime.now().isoformat()
+    
+    # 如果需要人工输入，将消息作为人工输入处理
+    if session_state.get("human_input_required"):
+        session_state["human_input"] = message
+    
+    # 异步流式处理
+    config = {"configurable": {"thread_id": session_id}}
+    async for chunk in compiled_graph.astream(session_state, config):
+        if isinstance(chunk, dict) and chunk.get("messages"):
+            # 找到最新的消息
+            messages = chunk.get("messages", [])
+            if messages and len(messages) > 0:
+                latest_message = messages[-1]
+                
+                # 只考虑AI消息
+                if isinstance(latest_message, dict) and latest_message.get("role") == "ai":
+                    content = latest_message.get("content", "")
+                    yield {"content": content, "session_id": session_id}
+                    
+    # 更新会话状态
+    SESSION_STATES[session_id] = session_state
+    
+    # 返回完成状态
+    yield {"content": "[DONE]", "session_id": session_id}
+
+# 异步处理消息
+async def aprocess_message(session_id: str, message: str) -> Dict[str, Any]:
+    """异步处理消息"""
+    # 获取会话状态
+    session_state = await get_or_create_session_state(session_id)
+    
+    # 创建图实例
+    checkpointer = get_checkpointer()
+    graph = build_graph()
+    compiled_graph = graph.compile(checkpointer=checkpointer)
+    
+    # 添加用户消息
+    user_message = {"role": "human", "content": message}
+    session_state["messages"].append(user_message)
+    session_state["last_updated_at"] = datetime.now().isoformat()
+    
+    # 如果需要人工输入，将消息作为人工输入处理
+    if session_state.get("human_input_required"):
+        session_state["human_input"] = message
+    
+    # 异步处理
+    config = {"configurable": {"thread_id": session_id}}
+    result = await compiled_graph.ainvoke(session_state, config)
+    
+    # 更新会话状态
+    SESSION_STATES[session_id] = result
+    
+    # 提取响应
+    messages = result.get("messages", [])
+    response = ""
+    if messages and len(messages) > 0:
+        latest_message = messages[-1]
+        if isinstance(latest_message, dict) and latest_message.get("role") == "ai":
+            response = latest_message.get("content", "")
+    
+    # 构建返回结果
+    return {
+        "response": response,
+        "completed": not result.get("human_input_required", False),
+        "metadata": {
+            "status": result.get("status", ""),
+            "current_intent": result.get("current_intent", {}).get("name") if result.get("current_intent") else None,
+            "confidence": result.get("confidence", 0)
         }
+    }
+
+# 获取或创建会话状态
+async def get_or_create_session_state(session_id: str) -> EnhancedAgentState:
+    """获取或创建会话状态"""
+    # 检查内存缓存
+    if session_id in SESSION_STATES:
+        return SESSION_STATES[session_id]
+    
+    # 尝试从持久化存储加载
+    checkpointer = get_checkpointer()
+    try:
+        state = await checkpointer.get(session_id)
+        if state:
+            SESSION_STATES[session_id] = state
+            return state
+    except Exception as e:
+        logger.warning(f"从持久化存储加载会话状态失败: {str(e)}")
+    
+    # 创建新会话
+    new_state = create_initial_state()
+    new_state["session_id"] = session_id
+    SESSION_STATES[session_id] = new_state
+    return new_state
+
+# 异步获取会话状态
+async def get_session_state(session_id: str) -> Optional[EnhancedAgentState]:
+    """异步获取会话状态"""
+    # 检查内存缓存
+    if session_id in SESSION_STATES:
+        return SESSION_STATES[session_id]
+    
+    # 尝试从持久化存储加载
+    checkpointer = get_checkpointer()
+    try:
+        state = await checkpointer.get(session_id)
+        if state:
+            SESSION_STATES[session_id] = state
+            return state
+    except Exception as e:
+        logger.warning(f"从持久化存储加载会话状态失败: {str(e)}")
+    
+    return None
+
+# 同步处理消息（用于向后兼容）
+def process_message(session_id: str, message: str) -> Dict[str, Any]:
+    """同步处理消息"""
+    # 使用asyncio运行异步函数
+    loop = asyncio.get_event_loop()
+    return loop.run_until_complete(aprocess_message(session_id, message))
 
 # 导出代理
 agent = {
