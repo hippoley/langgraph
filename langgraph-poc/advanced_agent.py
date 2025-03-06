@@ -1,24 +1,57 @@
+# 全局变量声明
+session_id = None
+memory_state = {}
+message_history = []
+intervention_records = []
+game_state = {
+    "active_game": None,  # 当前活跃的游戏
+    "guess_number": {
+        "active": False,
+        "target": 0,
+        "attempts": 0,
+        "max_attempts": 10,
+        "range": (1, 100)
+    },
+    "adventure": {
+        "active": False,
+        "current_location": "start",
+        "inventory": [],
+        "health": 100,
+        "visited": set()
+    }
+}
+
+# 导入所需库
 import os
+import json
+import time
+import random
+import datetime
+import threading
+import queue
+import uuid
+from enum import Enum
 from dotenv import load_dotenv
-from typing import Literal, TypedDict, Annotated, List, Dict, Any, Optional
+from typing import Literal, TypedDict, List, Dict, Any, Optional
+from typing_extensions import Annotated
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.message import add_messages
-import json
-import time
 from api_config import get_llm
-import random
-import datetime
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-import threading
-import queue
-import uuid
-from enum import Enum
+from visualization import (
+    GraphVisualizer, 
+    debug_info, 
+    performance_analyzer, 
+    interactive_debugger,
+    setup_debugging,
+    create_debug_report
+)
 
 # 加载环境变量
 load_dotenv()
@@ -235,9 +268,6 @@ workflow.add_edge("human_intervention", "agent")
 # 编译图
 agent = workflow.compile(checkpointer=MemorySaver())
 
-# 添加干预记录列表
-intervention_records = []
-
 # 检测是否需要人类干预的函数
 def needs_intervention(message: str) -> bool:
     """检测消息是否需要人类干预"""
@@ -261,27 +291,6 @@ def needs_intervention(message: str) -> bool:
             return True
     
     return False
-
-# 添加游戏功能
-
-# 游戏状态
-game_state = {
-    "active_game": None,  # 当前活跃的游戏
-    "guess_number": {
-        "active": False,
-        "target": 0,
-        "attempts": 0,
-        "max_attempts": 10,
-        "range": (1, 100)
-    },
-    "adventure": {
-        "active": False,
-        "current_location": "start",
-        "inventory": [],
-        "health": 100,
-        "visited": set()
-    }
-}
 
 # 游戏世界定义 - 文字冒险
 adventure_world = {
@@ -1084,283 +1093,256 @@ def handle_task_command(command: str) -> str:
     
     return "未知的任务命令。可用命令: task add, task depend, task list, task wait, task cancel, task wait all"
 
-# 修改主循环，添加任务管理命令
-if __name__ == "__main__":
-    print("高级LangGraph智能体示例")
-    print("输入'exit'退出，输入'help'查看帮助")
+# 全局变量
+session_id = None
+memory_state = {}
+message_history = []
+game_state = None
+
+def load_session_state(filepath):
+    """加载会话状态"""
+    global game_state, session_id, memory_state, message_history
+    try:
+        loaded_session_id, loaded_memory, loaded_history, loaded_game = load_agent_state(filepath)
+        # 更新当前状态
+        session_id = loaded_session_id
+        memory_state = loaded_memory
+        message_history = loaded_history
+        if loaded_game:
+            game_state = loaded_game
+        print(f"\n成功加载会话状态: {session_id}")
+    except Exception as e:
+        print(f"\n加载会话状态失败: {str(e)}")
+        raise e
+
+def setup_workflow():
+    """设置并返回工作流程图实例"""
+    # 创建可视化工具
+    visualizer = GraphVisualizer()
     
-    # 初始化知识库
-    initialize_knowledge_base()
+    # 添加工作流节点
+    visualizer.add_node("start", label="开始")
+    visualizer.add_node("process_input", label="处理输入")
+    visualizer.add_node("handle_commands", label="处理命令")
+    visualizer.add_node("generate_response", label="生成响应")
+    visualizer.add_node("update_state", label="更新状态")
     
-    # 启动任务管理器
-    task_manager.start()
+    # 添加节点之间的连接
+    visualizer.add_edge("start", "process_input")
+    visualizer.add_edge("process_input", "handle_commands")
+    visualizer.add_edge("handle_commands", "generate_response")
+    visualizer.add_edge("generate_response", "update_state")
+    visualizer.add_edge("update_state", "process_input")
     
-    # 创建会话ID
-    session_id = f"session_{int(time.time())}"
+    return visualizer
+
+def process_command(user_input: str) -> str:
+    """处理用户命令"""
+    # 检查是否是游戏命令
+    game_response = handle_game_command(user_input)
+    if game_response:
+        return game_response
+        
+    # 检查是否是任务命令
+    if user_input.lower().startswith("task "):
+        return handle_task_command(user_input)
+        
+    # 检查是否是知识库命令
+    if user_input.lower().startswith("kb "):
+        if user_input.lower().startswith("kb add "):
+            file_path = user_input[7:].strip()
+            return add_document_to_knowledge_base(file_path)
+        elif user_input.lower().startswith("kb query "):
+            query = user_input[9:].strip()
+            return query_knowledge_base(query)
+            
+    # 添加调试和可视化命令
+    if user_input.lower() == "debug status":
+        return f"""
+调试状态:
+- 会话ID: {session_id}
+- 消息历史: {len(message_history)} 条消息
+- 内存状态: {len(memory_state)} 个记录
+- 游戏状态: {'活跃' if game_state['active_game'] else '未激活'}
+"""
+
+    if user_input.lower() == "debug report":
+        report_path = create_debug_report()
+        return f"调试报告已生成: {report_path}"
+        
+    if user_input.lower() == "show workflow":
+        workflow_visualizer = setup_workflow()
+        workflow_visualizer.draw(save_path="workflow_graph.png")
+        return "工作流程图已保存为 workflow_graph.png"
+        
+    if user_input.lower() == "performance":
+        metrics = performance_analyzer.get_metrics()
+        summary = performance_analyzer.get_summary()
+        return f"""
+性能指标摘要:
+- 总操作数: {summary.get('total_operations', 0)}
+- 总执行时间: {summary.get('total_duration', 0):.2f} 秒
+- 平均执行时间: {summary.get('avg_duration', 0):.2f} 秒
+- 最长操作: {summary.get('max_duration', 0):.2f} 秒
+- 最短操作: {summary.get('min_duration', 0):.2f} 秒
+"""
+        
+    if user_input.lower() == "help":
+        return """
+可用命令:
+基础命令:
+- 'exit': 退出程序
+- 'help': 显示此帮助信息
+
+游戏命令:
+- 'game': 显示可用游戏
+- '玩游戏': 同上
+- '退出游戏': 退出当前游戏
+
+任务管理:
+- 'task add <任务名> [延迟秒数]': 添加任务
+- 'task depend <任务名> <依赖任务1> [依赖任务2...]': 添加依赖任务
+- 'task list': 列出所有任务
+- 'task wait <任务ID>': 等待指定任务完成
+- 'task cancel <任务ID>': 取消任务
+- 'task wait all': 等待所有任务完成
+
+知识库操作:
+- 'kb add <文件路径>': 向知识库添加文档
+- 'kb query <查询>': 查询知识库
+
+调试和可视化:
+- 'debug status': 显示当前调试状态
+- 'debug report': 生成调试报告
+- 'show workflow': 显示工作流程图
+- 'performance': 显示性能指标
+
+会话管理:
+- 'save': 保存当前会话状态
+- 'load': 加载已保存的会话状态
+- 'list': 列出所有保存的会话状态
+"""
+
+    # 处理其他命令...
+    if user_input.lower() == "save":
+        try:
+            filepath = save_agent_state(session_id, memory_state, message_history, game_state)
+            return f"会话状态已保存到: {filepath}"
+        except Exception as e:
+            return f"保存会话状态失败: {str(e)}"
+            
+    if user_input.lower() == "load":
+        states = list_saved_states()
+        if not states:
+            return "没有找到已保存的会话状态"
+            
+        result = ["请选择要加载的会话状态 (输入编号):"]
+        for i, state in enumerate(states, 1):
+            result.append(f"{i}. 会话ID: {state['session_id']}, 时间: {state['timestamp']}")
+        return "\n".join(result)
+        
+    if user_input.lower() == "list":
+        states = list_saved_states()
+        if not states:
+            return "没有找到已保存的会话状态"
+            
+        result = ["已保存的会话状态:"]
+        for i, state in enumerate(states, 1):
+            result.append(f"{i}. 会话ID: {state['session_id']}, 时间: {state['timestamp']}, 文件: {state['filename']}")
+        return "\n".join(result)
+        
+    # 如果不是特殊命令，交给AI处理
+    try:
+        # 使用较短的消息历史减少token使用
+        recent_messages = message_history[-5:] if len(message_history) > 5 else message_history
+        response = model.invoke(recent_messages + [HumanMessage(content=user_input)])
+        return response.content
+    except Exception as e:
+        return f"处理消息时出错: {str(e)}"
+
+def main():
+    global session_id, memory_state, message_history, game_state
     
-    # 配置
-    config = {"configurable": {"thread_id": session_id}}
+    # 设置工作流程可视化
+    workflow_visualizer = setup_workflow()
     
-    # 不需要预先初始化会话，直接开始交互
-    print("智能体已准备就绪，请输入您的问题...")
-    
-    # 初始化内存状态
-    memory_state = {}
-    
-    # 初始化消息历史
-    message_history = [SystemMessage(content="你是一个高级AI助手，可以使用工具并记住用户提供的信息。你可以访问知识库来回答问题。")]
-    
-    # 干预模式标志
-    intervention_mode = False
+    # 设置性能分析
+    performance_analyzer.start_operation("session_initialization")
     
     try:
+        # 初始化会话状态
+        session_id = str(uuid.uuid4())
+        memory_state = {"context": [], "summary": ""}
+        message_history = []
+        game_state = {
+            "active_game": None,
+            "guess_number": {"target": None, "attempts": []},
+            "adventure": {"current_scene": None, "inventory": []}
+        }
+        
+        debug_info.log("Session initialized", level="INFO", session_id=session_id)
+        performance_analyzer.end_operation("session_initialization")
+        
+        # 主循环
         while True:
             try:
-                # 根据当前模式显示不同的提示
-                if intervention_mode:
-                    user_input = input("\n[人类干预模式] 请输入干预内容 (输入'end'结束干预): ")
-                    if user_input.lower() == "end":
-                        intervention_mode = False
-                        print("\n人类干预模式已结束")
-                        continue
-                else:
-                    user_input = input("\n您: ")
+                # 记录性能指标
+                performance_analyzer.start_operation("input_processing")
                 
-                if user_input.lower() == "exit":
+                # 获取用户输入
+                user_input = input("\nUser: ").strip()
+                
+                if user_input.lower() in ["exit", "quit"]:
+                    debug_info.log("User requested exit", level="INFO")
                     break
                 
-                if user_input.lower() == "help":
-                    print("\n可用命令:")
-                    print("- 'exit': 退出程序")
-                    print("- 'memory': 显示当前记忆")
-                    print("- 'intervene': 手动触发人类干预")
-                    print("- 'interventions': 显示干预记录")
-                    print("- '记住xxx': 将信息存入记忆")
-                    print("- '记住key:value': 将键值对存入记忆")
-                    print("- 'clear': 清除对话历史，减少API调用量")
-                    print("- '玩游戏'或'game': 显示可用游戏")
-                    print("- 'save': 保存当前会话状态")
-                    print("- 'load': 加载已保存的会话状态")
-                    print("- 'list': 列出所有保存的会话状态")
-                    print("- 'kb add <文件路径>': 向知识库添加文档")
-                    print("- 'kb query <查询>': 直接查询知识库")
-                    print("- 'task add <任务名> [延迟秒数]': 添加任务")
-                    print("- 'task depend <任务名> <依赖任务1> [<依赖任务2> ...]': 添加依赖任务")
-                    print("- 'task list': 列出所有任务")
-                    print("- 'task wait <任务ID>': 等待指定任务完成")
-                    print("- 'task cancel <任务ID>': 取消任务")
-                    print("- 'task wait all': 等待所有任务完成")
-                    continue
+                # 处理用户输入
+                debug_info.log("Processing user input", level="DEBUG", input=user_input)
                 
-                # 处理任务命令
-                if user_input.lower().startswith("task "):
-                    result = handle_task_command(user_input)
-                    print(f"\n{result}")
-                    continue
+                # 更新交互式调试器状态
+                interactive_debugger.update_state({
+                    "session_id": session_id,
+                    "memory_state": memory_state,
+                    "message_history": message_history,
+                    "game_state": game_state
+                })
                 
-                # 处理知识库命令
-                if user_input.lower().startswith("kb add "):
-                    file_path = user_input[7:].strip()
-                    result = add_document_to_knowledge_base(file_path)
-                    print(f"\n{result}")
-                    continue
+                performance_analyzer.end_operation("input_processing")
                 
-                if user_input.lower().startswith("kb query "):
-                    query = user_input[9:].strip()
-                    result = query_knowledge_base(query)
-                    print(f"\n查询结果:\n{result}")
-                    continue
+                # 处理命令
+                performance_analyzer.start_operation("command_processing")
+                response = process_command(user_input)
+                performance_analyzer.end_operation("command_processing")
                 
-                # 处理保存命令
-                if user_input.lower() == "save":
-                    try:
-                        filepath = save_agent_state(session_id, memory_state, message_history, game_state)
-                        print(f"\n会话状态已保存到: {filepath}")
-                    except Exception as e:
-                        print(f"\n保存会话状态失败: {str(e)}")
-                    continue
+                # 打印响应
+                print("\nAssistant:", response)
                 
-                # 处理列出保存状态命令
-                if user_input.lower() == "list":
-                    states = list_saved_states()
-                    if states:
-                        print("\n已保存的会话状态:")
-                        for i, state in enumerate(states, 1):
-                            print(f"{i}. 会话ID: {state['session_id']}, 时间: {state['timestamp']}, 文件: {state['filename']}")
-                    else:
-                        print("\n没有找到已保存的会话状态")
-                    continue
+                # 更新消息历史
+                message_history.append({"role": "user", "content": user_input})
+                message_history.append({"role": "assistant", "content": response})
                 
-                # 处理加载命令
-                if user_input.lower() == "load":
-                    states = list_saved_states()
-                    if not states:
-                        print("\n没有找到已保存的会话状态")
-                        continue
-                    
-                    print("\n请选择要加载的会话状态 (输入编号):")
-                    for i, state in enumerate(states, 1):
-                        print(f"{i}. 会话ID: {state['session_id']}, 时间: {state['timestamp']}")
-                    
-                    try:
-                        choice = int(input("\n请输入编号: "))
-                        if 1 <= choice <= len(states):
-                            filepath = states[choice-1]["filepath"]
-                            try:
-                                session_id, loaded_memory, loaded_history, loaded_game = load_agent_state(filepath)
-                                # 更新当前状态
-                                session_id = session_id
-                                memory_state = loaded_memory
-                                message_history = loaded_history
-                                if loaded_game:
-                                    global game_state
-                                    game_state = loaded_game
-                                print(f"\n成功加载会话状态: {session_id}")
-                            except Exception as e:
-                                print(f"\n加载会话状态失败: {str(e)}")
-                        else:
-                            print("\n无效的选择")
-                    except ValueError:
-                        print("\n请输入有效的数字")
-                    continue
+                # 定期生成调试报告
+                if len(message_history) % 10 == 0:
+                    report_path = create_debug_report()
+                    debug_info.log(f"Debug report generated", level="INFO", path=report_path)
                 
-                if user_input.lower() == "memory":
-                    # 直接使用内存中的状态
-                    if memory_state:
-                        print("\n当前记忆:")
-                        for key, value in memory_state.items():
-                            print(f"- {key}: {value}")
-                    else:
-                        print("\n当前没有记忆")
-                    continue
-                
-                if user_input.lower() == "interventions":
-                    # 显示干预记录
-                    if intervention_records:
-                        print("\n干预记录:")
-                        for i, record in enumerate(intervention_records, 1):
-                            print(f"{i}. 时间: {record['time']}")
-                            print(f"   触发: {record['trigger']}")
-                            print(f"   干预内容: {record['content']}")
-                            print(f"   AI回复: {record['response']}")
-                            print()
-                    else:
-                        print("\n当前没有干预记录")
-                    continue
-                    
-                if user_input.lower() == "intervene" or (not intervention_mode and needs_intervention(user_input)):
-                    # 如果是手动触发干预或自动检测到需要干预
-                    if user_input.lower() != "intervene":
-                        # 自动触发的情况，先保存用户的原始消息
-                        original_message = user_input
-                        print(f"\n检测到可能需要人类干预的内容: '{user_input}'")
-                        print("已自动进入人类干预模式")
-                    else:
-                        original_message = "手动触发干预"
-                        print("正在进入人类干预模式...")
-                    
-                    intervention_mode = True
-                    print("\n请输入干预内容，输入'end'结束干预")
-                    continue
-                
-                if intervention_mode:
-                    # 处理干预内容
-                    intervention_content = user_input
-                    print("正在处理人类干预...")
-                    
-                    # 创建干预消息
-                    intervention_message = f"[人类干预] {intervention_content}"
-                    message_history.append(HumanMessage(content=intervention_message))
-                    
-                    # 记录干预
-                    intervention_record = {
-                        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "trigger": original_message,
-                        "content": intervention_content,
-                        "response": ""
-                    }
-                    
-                    # 添加AI回复
-                    try:
-                        # 使用较短的消息历史减少token使用
-                        recent_messages = message_history[-5:] if len(message_history) > 5 else message_history
-                        response = model.invoke(recent_messages)
-                        message_history.append(response)
-                        print(f"\nAI: {response.content}")
-                        
-                        # 更新干预记录
-                        intervention_record["response"] = response.content
-                        intervention_records.append(intervention_record)
-                    except Exception as e:
-                        print(f"模型调用失败: {str(e)}")
-                        fallback_response = AIMessage(content="收到人类干预。我将根据您的指导调整回复。")
-                        message_history.append(fallback_response)
-                        print(f"\nAI: {fallback_response.content}")
-                        
-                        # 更新干预记录
-                        intervention_record["response"] = fallback_response.content
-                        intervention_records.append(intervention_record)
-                    
-                    print("\n干预已处理并记录")
-                    intervention_mode = False
-                    continue
-                
-                if user_input.lower() == "clear":
-                    # 清除对话历史，只保留系统消息
-                    message_history = [SystemMessage(content="你是一个高级AI助手，可以使用工具并记住用户提供的信息。")]
-                    print("\n已清除对话历史，减少API调用量")
-                    continue
-                
-                # 检查是否是游戏命令
-                game_response = handle_game_command(user_input)
-                if game_response:
-                    print(f"\n{game_response}")
-                    continue
-                
-                # 创建人类消息
-                human_message = HumanMessage(content=user_input)
-                message_history.append(human_message)
-                
-                try:
-                    print("正在处理您的消息...")
-                    
-                    # 检查是否是记忆请求
-                    if "记住" in user_input:
-                        # 直接处理记忆请求
-                        content = user_input
-                        parts = content.split("记住", 1)
-                        if len(parts) > 1:
-                            info = parts[1].strip()
-                            # 尝试提取键值对
-                            if ":" in info or "：" in info:
-                                key, value = info.replace("：", ":").split(":", 1)
-                                memory_state[key.strip()] = value.strip()
-                                print(f"已记住键值对: {key.strip()} = {value.strip()}")
-                            else:
-                                # 如果没有明确的键，使用时间戳作为键
-                                memory_state[f"记忆_{int(time.time())}"] = info
-                                print(f"已记住信息: {info}")
-                        
-                        ai_response = AIMessage(content="我已经记住了这个信息。")
-                        message_history.append(ai_response)
-                        print(f"\nAI: {ai_response.content}")
-                        continue
-                    
-                    # 使用较短的消息历史减少token使用
-                    try:
-                        recent_messages = message_history[-5:] if len(message_history) > 5 else message_history
-                        response = model.invoke(recent_messages)
-                        message_history.append(response)
-                        print(f"\nAI: {response.content}")
-                    except Exception as e:
-                        print(f"模型调用失败: {str(e)}")
-                        fallback_response = AIMessage(content="抱歉，我无法处理您的请求。请尝试清除对话历史（输入'clear'）或简化您的问题。")
-                        message_history.append(fallback_response)
-                        print(f"\nAI: {fallback_response.content}")
-                    
-                except Exception as e:
-                    print(f"\n处理消息时出错: {str(e)}")
             except Exception as e:
-                print(f"发生未知错误: {str(e)}")
+                debug_info.log(f"Error in main loop: {str(e)}", level="ERROR")
+                print(f"\nError: {str(e)}")
+                continue
+    
     except Exception as e:
-        print(f"发生未知错误: {str(e)}")
+        debug_info.log(f"Fatal error: {str(e)}", level="ERROR")
+        print(f"\nFatal error: {str(e)}")
+    
+    finally:
+        # 保存最终的调试报告
+        final_report_path = create_debug_report()
+        print(f"\nFinal debug report generated: {final_report_path}")
+        
+        # 显示工作流程图
+        workflow_visualizer.draw(save_path="workflow_graph.png")
+        print("\nWorkflow graph saved as workflow_graph.png")
+
+if __name__ == "__main__":
+    main()
