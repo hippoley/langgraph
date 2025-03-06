@@ -7,10 +7,18 @@ This project is a minimal Proof of Concept (POC) for LangGraph, showcasing 80% o
 This POC includes the following examples:
 
 1. **Simple Agent (simple_agent.py)**: A LangGraph agent built from scratch, demonstrating basic state graphs and tool calling.
-2. **Prebuilt Agent (simple_agent_prebuilt.py)**: An agent quickly created using LangGraph's prebuilt functions.
-3. **Advanced Agent (advanced_agent.py)**: Demonstrates more advanced features, including memory and human intervention.
-4. **Multi-Agent System (multi_agent_system.py)**: Demonstrates a workflow where multiple agents collaborate to complete tasks.
-5. **Streaming and Breakpoints (streaming_breakpoints.py)**: Demonstrates streaming output and breakpoint functionality.
+2. **Advanced Agent (advanced_agent.py)**: Demonstrates more advanced features, including memory and human intervention.
+3. **Multi-Agent System (multi_agent_system.py)**: Demonstrates a workflow where multiple agents collaborate to complete tasks.
+4. **Streaming and Breakpoints (streaming_breakpoints.py)**: Demonstrates streaming output and breakpoint functionality.
+
+## Additional Modules
+
+The POC also includes several advanced modules:
+
+1. **Visualization (visualization.py)**: Tools for visualizing workflow graphs and state transitions.
+2. **Dialog Manager (dialog_manager.py)**: Advanced dialog management capabilities.
+3. **Content Workflow (content_workflow.py)**: Content generation and processing workflows.
+4. **Monitoring (monitoring.py)**: Monitoring and observability tools.
 
 ## Installation and Startup
 
