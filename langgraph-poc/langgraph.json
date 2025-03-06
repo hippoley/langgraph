@@ -8,7 +8,8 @@
         "simple_agent": "./simple_agent.py:app",
         "advanced_agent": "./advanced_agent.py:agent",
         "multi_agent": "./multi_agent_system.py:agent",
-        "streaming": "./streaming_breakpoints.py:agent"
+        "streaming": "./streaming_breakpoints.py:agent",
+        "enhanced_agent": "./enhanced_agent.py:agent"
     },
     "env_file": "./.env"
 } 
