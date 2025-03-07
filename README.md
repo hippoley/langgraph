@@ -15,7 +15,18 @@
 [LangGraph](https://langchain-ai.github.io/langgraph/) is a library for building
 stateful, multi-actor applications with LLMs, used to create agent and multi-agent
 workflows. Check out an introductory tutorial [here](https://langchain-ai.github.io/langgraph/tutorials/introduction/).
-
+第二阶段：增强断点与人机协作 (2天)
+实现条件断点
+添加断点回调
+改进人机交互界面
+第三阶段：监控与可视化 (3天)
+完善图可视化
+实现执行追踪
+添加性能监控
+第四阶段：高级图结构与分布式 (5天)
+实现动态子图
+添加并行执行
+构建分布式框架
 
 LangGraph is inspired by [Pregel](https://research.google/pubs/pub37252/) and [Apache Beam](https://beam.apache.org/). The public interface draws inspiration from [NetworkX](https://networkx.org/documentation/latest/). LangGraph is built by LangChain Inc, the creators of LangChain, but can be used without LangChain.
 

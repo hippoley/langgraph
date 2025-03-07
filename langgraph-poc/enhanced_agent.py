@@ -531,7 +531,19 @@ tools = {
 # ============== 节点函数 ==============
 
 async def user_input_processor(state: EnhancedAgentState) -> EnhancedAgentState:
-    """处理用户输入，准备状态"""
+    """处理用户输入，准备状态
+    
+    处理用户输入消息，更新状态，准备执行后续节点
+    
+    Args:
+        state: 当前状态
+        
+    Returns:
+        更新后的状态
+    """
+    # 记录开始时间
+    start_time = time.time()
+    
     # 复制状态
     new_state = state.copy()
     
@@ -549,32 +561,118 @@ async def user_input_processor(state: EnhancedAgentState) -> EnhancedAgentState:
         # 没有找到用户消息，返回错误
         new_state["error"] = "未找到用户消息"
         new_state["status"] = "error"
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "missing_user_message",
+            "component": "user_input_processor",
+            "session_id": new_state.get("session_id", "unknown")
+        })
+        
         return new_state
     
     try:
-        # 更新记忆系统
+        # 获取会话ID
         session_id = new_state.get("session_id", "default-session")
-        new_state = await update_memory_with_conversation(session_id, new_state)
+        
+        # 记录消息指标
+        record_business_metric("message_count", 1, {
+            "session_id": session_id,
+            "is_command": user_message.get("content", "").startswith("/"),
+            "message_length": len(user_message.get("content", ""))
+        })
+        
+        # 更新上下文
+        try:
+            new_state = await update_memory_with_conversation(session_id, new_state)
+        except Exception as e:
+            logger.warning(f"更新上下文记忆时出错: {str(e)}，继续处理")
+            # 记录但不中断流程
+            record_business_metric("error_count", 1, {
+                "error_type": "memory_update_error",
+                "error_message": str(e),
+                "session_id": session_id
+            })
         
         # 检查置信度（用于断点系统）
-        # 计算一个简单的置信度指标：如果消息长度小于10个字符，降低置信度
         message_content = user_message.get("content", "")
-        if len(message_content) < 10:
-            new_state["confidence"] = 0.6
-        else:
-            new_state["confidence"] = 0.9
         
-        # 设置状态为已处理
-        new_state["status"] = "user_input_processed"
-        new_state["next_step"] = "intent_recognizer"
+        # 计算更全面的置信度指标
+        confidence = 0.8  # 默认中等置信度
+        
+        # 基于消息长度调整置信度
+        if len(message_content) < 5:
+            confidence -= 0.3  # 极短消息，可能缺乏上下文
+        elif len(message_content) < 10:
+            confidence -= 0.2  # 较短消息
+        elif len(message_content) > 100:
+            confidence += 0.1  # 详细消息，可能含有更多信息
+        
+        # 基于上下文连续性调整置信度
+        if len(new_state["messages"]) <= 1:
+            confidence -= 0.1  # 首次交互，缺乏上下文
+        
+        # 基于当前意图调整置信度
+        if new_state.get("current_intent"):
+            # 已有意图上下文，提高置信度
+            confidence += 0.1
+            
+            # 如果有部分填充的槽位，进一步提高置信度
+            if new_state.get("slots") and len(new_state["slots"]) > 0:
+                confidence += 0.1
+        
+        # 确保置信度在合理范围内
+        confidence = max(0.1, min(1.0, confidence))
+        
+        # 更新状态中的置信度
+        new_state["confidence"] = confidence
+        
+        # 记录置信度指标
+        record_business_metric("confidence_level", confidence, {
+            "session_id": session_id,
+            "message_length": len(message_content),
+            "has_context": len(new_state["messages"]) > 1,
+            "has_intent": bool(new_state.get("current_intent"))
+        })
+        
+        # 设置下一步处理
+        if new_state.get("human_input"):
+            # 如果有人工输入，优先处理
+            new_state["next_step"] = "process_human_input"
+        elif new_state.get("error"):
+            # 如果有错误，标记状态
+            new_state["status"] = "error"
+            new_state["next_step"] = "fallback_handler"
+        else:
+            # 默认流程
+            new_state["status"] = "input_processed"
+            new_state["next_step"] = "check_return_to_previous"
+        
+        # 计算处理时间
+        processing_time = time.time() - start_time
+        
+        # 记录处理时间
+        record_business_metric("response_time", processing_time, {
+            "component": "user_input_processor",
+            "session_id": session_id
+        })
+        
+        return new_state
         
     except Exception as e:
-        # 记录错误
         logger.error(f"处理用户输入时出错: {str(e)}")
-        new_state["error"] = f"处理用户输入时出错: {str(e)}"
+        new_state["error"] = f"处理用户输入失败: {str(e)}"
         new_state["status"] = "error"
-    
-    return new_state
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "exception",
+            "component": "user_input_processor",
+            "error_message": str(e),
+            "session_id": new_state.get("session_id", "unknown")
+        })
+        
+        return new_state
 
 async def intent_recognizer(state: EnhancedAgentState) -> EnhancedAgentState:
     """意图识别节点
@@ -942,103 +1040,88 @@ async def slot_filler(state: EnhancedAgentState) -> EnhancedAgentState:
     # 记录开始时间
     start_time = time.time()
     
-        # 使用图流式处理消息
-        async for event in compiled_graph.astream(state):
-            # 提取当前状态
-            current_state = event.get("state", {})
+    # 使用图流式处理消息
+    async for event in compiled_graph.astream(state):
+        # 提取当前状态
+        current_state = event.get("state", {})
+        
+        # 检查是否正在等待人工输入
+        if current_state.get("human_input_required", False):
+            # 生成调试信息
+            debug_info = generate_debug_info(current_state)
             
-            # 检查是否正在等待人工输入
-            if current_state.get("human_input_required", False):
-                # 生成调试信息
-                debug_info = generate_debug_info(current_state)
-                
-                # 返回等待人工输入的状态
-                yield {
-                    "session_id": session_id,
-                    "message": "等待人工输入",
-                    "type": "waiting_for_human",
-                    "debug_info": debug_info,
-                    "waiting_for_human": True,
-                    "state": current_state
-                }
-                
-                # 更新会话状态
-                SESSION_STATES[session_id] = current_state
-                
-                # 保存会话状态
-                await save_session_state(session_id, current_state)
-                return
-            
-            # 获取最后一条助手消息
-            last_assistant_message = None
-            for msg in reversed(current_state.get("messages", [])):
-                if msg.get("role") in ["assistant", "ai"]:
-                    last_assistant_message = msg.get("content", "")
-                    break
-            
-            if last_assistant_message:
-                # 生成调试信息
-                debug_info = generate_debug_info(current_state)
-                
-                # 返回最新的消息
-                yield {
-                    "session_id": session_id,
-                    "message": last_assistant_message,
-                    "type": "message",
-                    "debug_info": debug_info,
-                    "node": event.get("node", "unknown")
-                }
+            # 返回等待人工输入的状态
+            yield {
+                "session_id": session_id,
+                "message": "等待人工输入",
+                "type": "waiting_for_human",
+                "debug_info": debug_info,
+                "waiting_for_human": True,
+                "state": current_state
+            }
             
             # 更新会话状态
             SESSION_STATES[session_id] = current_state
-        
-        # 记录处理结束时间并计算耗时
-        end_time = time.time()
-        processing_time = end_time - start_time
-        
-        # 从最终状态获取最后的消息
-        final_state = SESSION_STATES.get(session_id, {})
+            
+            # 保存会话状态
+            await save_session_state(session_id, current_state)
+            return
         
         # 获取最后一条助手消息
         last_assistant_message = None
-        for msg in reversed(final_state.get("messages", [])):
+        for msg in reversed(current_state.get("messages", [])):
             if msg.get("role") in ["assistant", "ai"]:
                 last_assistant_message = msg.get("content", "")
                 break
         
-        if not last_assistant_message:
-            last_assistant_message = "处理完成，但没有生成响应。"
-        
-        # 生成最终的调试信息
-        final_debug_info = generate_debug_info(final_state)
-        final_debug_info["processing_time"] = f"{processing_time:.2f}秒"
-        
-        # 返回最终结果
-        yield {
-            "session_id": session_id,
-            "message": last_assistant_message,
-            "type": "final",
-            "debug_info": final_debug_info,
-            "processing_time": processing_time
-        }
-        
-        # 保存会话状态
-        await save_session_state(session_id, final_state)
-        
-    except Exception as e:
-        logger.error(f"流式处理消息时出错: {str(e)}", exc_info=True)
-        
-        # 返回错误信息
-        yield {
-            "session_id": session_id,
-            "message": f"处理消息时出错: {str(e)}",
-            "type": "error",
-            "error": str(e),
-            "debug_info": {
-                "error": str(e),
-                "traceback": traceback.format_exc()
+        if last_assistant_message:
+            # 生成调试信息
+            debug_info = generate_debug_info(current_state)
+            
+            # 返回最新的消息
+            yield {
+                "session_id": session_id,
+                "message": last_assistant_message,
+                "type": "message",
+                "debug_info": debug_info,
+                "node": event.get("node", "unknown")
             }
-        }
+        
+        # 更新会话状态
+        SESSION_STATES[session_id] = current_state
+    
+    # 记录处理结束时间并计算耗时
+    end_time = time.time()
+    processing_time = end_time - start_time
+    
+    # 从最终状态获取最后的消息
+    final_state = SESSION_STATES.get(session_id, {})
+    
+    # 获取最后一条助手消息
+    last_assistant_message = None
+    for msg in reversed(final_state.get("messages", [])):
+        if msg.get("role") in ["assistant", "ai"]:
+            last_assistant_message = msg.get("content", "")
+            break
+    
+    if not last_assistant_message:
+        last_assistant_message = "处理完成，但没有生成响应。"
+    
+    # 生成最终的调试信息
+    final_debug_info = generate_debug_info(final_state)
+    final_debug_info["processing_time"] = f"{processing_time:.2f}秒"
+    
+    # 返回最终结果
+    yield {
+        "session_id": session_id,
+        "message": last_assistant_message,
+        "type": "final",
+        "debug_info": final_debug_info,
+        "processing_time": processing_time
+    }
+    
+    # 保存会话状态
+    await save_session_state(session_id, final_state)
 
 # 同步处理消息（用于向后兼容）
 def process_message(session_id: str, message: str) -> Dict[str, Any]:
@@ -1754,3 +1837,1499 @@ def process_human_input(state: EnhancedAgentState) -> EnhancedAgentState:
         new_state["status"] = "user_input_processor"
     
     return new_state
+
+async def knowledge_retriever(state: EnhancedAgentState) -> EnhancedAgentState:
+    """知识检索节点
+    
+    基于用户意图和槽位执行知识检索
+    
+    Args:
+        state: 当前状态
+        
+    Returns:
+        更新后的状态，包含检索结果
+    """
+    # 记录开始时间
+    start_time = time.time()
+    
+    # 复制状态
+    new_state = state.copy()
+    
+    # 获取当前意图
+    current_intent = new_state.get("current_intent")
+    if not current_intent:
+        # 如果没有当前意图，跳过检索
+        logger.info("没有当前意图，跳过知识检索")
+        new_state["next_step"] = "router"
+        return new_state
+    
+    # 获取用户槽位
+    slots = new_state.get("slots", {})
+    
+    # 获取用户问题
+    user_query = ""
+    for msg in reversed(new_state["messages"]):
+        if msg.get("role") == "human":
+            user_query = msg.get("content", "")
+            break
+    
+    if not user_query:
+        # 如果没有用户问题，返回错误
+        new_state["error"] = "没有找到用户问题，无法执行知识检索"
+        new_state["status"] = "error"
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "missing_user_query",
+            "component": "knowledge_retriever",
+            "session_id": new_state.get("session_id", "unknown")
+        })
+        
+        return new_state
+    
+    try:
+        # 获取当前意图名称
+        intent_name = current_intent.get("name", "unknown")
+        
+        # 准备检索查询
+        # 1. 基于意图和槽位构建查询
+        structured_query = f"Intent: {intent_name}\n"
+        if slots:
+            structured_query += "Slots:\n"
+            for key, value in slots.items():
+                structured_query += f"- {key}: {value}\n"
+        
+        # 2. 添加用户原始查询
+        structured_query += f"User Query: {user_query}"
+        
+        logger.info(f"执行知识检索，查询: {structured_query[:100]}...")
+        
+        # 执行检索 (使用带记忆的增强检索)
+        session_id = new_state.get("session_id", "default-session")
+        retrieval_results = await retrieve_with_memory(
+            query=structured_query,
+            session_id=session_id,
+            top_k=5  # 获取前5个最相关的结果
+        )
+        
+        # 计算检索质量分数
+        retrieval_quality = 0.0
+        if retrieval_results:
+            # 基于最高相关性分数评估质量
+            top_score = retrieval_results[0].score if retrieval_results else 0
+            retrieval_quality = min(1.0, top_score * 1.2)  # 归一化到0-1
+            
+            # 基于结果数量调整质量
+            result_count_factor = min(1.0, len(retrieval_results) / 3)  # 至少需要3个结果才算完整
+            retrieval_quality = retrieval_quality * 0.8 + result_count_factor * 0.2
+        
+        # 记录检索指标
+        record_business_metric("knowledge_retrieval_count", 1, {
+            "session_id": session_id,
+            "intent": intent_name,
+            "result_count": len(retrieval_results),
+            "quality_score": retrieval_quality
+        })
+        
+        # 格式化检索结果
+        formatted_results = format_retrieval_results(retrieval_results)
+        
+        # 更新状态
+        new_state["retrieval_results"] = formatted_results
+        new_state["status"] = "knowledge_retrieved"
+        new_state["next_step"] = "router"
+        
+        # 更新业务指标
+        new_state = update_state_metrics(new_state, {
+            "knowledge_retrieval_counts": new_state.get("business_metrics", {}).get("knowledge_retrieval_counts", 0) + 1,
+            "last_retrieval_quality": retrieval_quality
+        })
+        
+        # 计算处理时间
+        processing_time = time.time() - start_time
+        
+        # 记录处理时间
+        record_business_metric("response_time", processing_time, {
+            "component": "knowledge_retriever",
+            "session_id": session_id,
+            "intent": intent_name,
+            "result_count": len(retrieval_results)
+        })
+        
+        return new_state
+        
+    except Exception as e:
+        logger.error(f"知识检索过程中出错: {str(e)}")
+        new_state["error"] = f"知识检索失败: {str(e)}"
+        new_state["status"] = "error"
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "retrieval_error",
+            "component": "knowledge_retriever",
+            "error_message": str(e),
+            "session_id": new_state.get("session_id", "unknown"),
+            "intent": current_intent.get("name", "unknown")
+        })
+        
+        return new_state
+
+async def astream_message(session_id: str, message: str) -> AsyncIterator[Dict[str, Any]]:
+    """异步流式处理用户消息
+    
+    处理用户消息并以流式方式返回结果
+    
+    Args:
+        session_id: 会话ID
+        message: 用户消息
+        
+    Yields:
+        以流式方式返回处理结果
+    """
+    try:
+        # 获取会话状态
+        state = SESSION_STATES.get(session_id)
+        
+        # 如果没有会话状态，初始化
+        if not state:
+            state = initialize_state()
+            state["session_id"] = session_id
+            state["created_at"] = datetime.now().isoformat()
+            logger.info(f"初始化新会话: {session_id}")
+            
+            # 返回初始化消息
+            yield {
+                "session_id": session_id,
+                "message": "会话已初始化",
+                "type": "status",
+                "debug_info": generate_debug_info(state)
+            }
+        
+        # 更新最后活动时间
+        state["last_updated_at"] = datetime.now().isoformat()
+        
+        # 检查是否为调试命令
+        is_debug_command = message.startswith("/")
+        
+        # 如果是调试命令且正在等待人工输入，直接设置为人工输入
+        if is_debug_command and state.get("human_input_required", False):
+            state["human_input"] = message
+            # 使用处理人工输入函数处理
+            state = process_human_input(state)
+            
+            # 生成调试信息
+            debug_info = generate_debug_info(state)
+            
+            # 返回命令处理结果
+            yield {
+                "session_id": session_id,
+                "message": "命令已处理",
+                "type": "command_result",
+                "debug_info": debug_info,
+                "waiting_for_human": state.get("human_input_required", False)
+            }
+            
+            # 保存会话状态
+            await save_session_state(session_id, state)
+            return
+        
+        # 添加用户消息到历史
+        state["messages"].append({
+            "role": "human",
+            "content": message,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        # 返回已接收消息的确认
+        yield {
+            "session_id": session_id,
+            "message": "消息已接收",
+            "type": "status",
+            "debug_info": generate_debug_info(state)
+        }
+        
+        # 记录处理开始时间
+        start_time = time.time()
+        
+        # 使用图流式处理消息
+        async for event in compiled_graph.astream(state):
+            # 提取当前状态
+            current_state = event.get("state", {})
+            
+            # 检查是否正在等待人工输入
+            if current_state.get("human_input_required", False):
+                # 生成调试信息
+                debug_info = generate_debug_info(current_state)
+                
+                # 返回等待人工输入的状态
+                yield {
+                    "session_id": session_id,
+                    "message": "等待人工输入",
+                    "type": "waiting_for_human",
+                    "debug_info": debug_info,
+                    "waiting_for_human": True,
+                    "state": current_state
+                }
+                
+                # 更新会话状态
+                SESSION_STATES[session_id] = current_state
+                
+                # 保存会话状态
+                await save_session_state(session_id, current_state)
+                return
+            
+            # 获取最后一条助手消息
+            last_assistant_message = None
+            for msg in reversed(current_state.get("messages", [])):
+                if msg.get("role") in ["assistant", "ai"]:
+                    last_assistant_message = msg.get("content", "")
+                    break
+            
+            if last_assistant_message:
+                # 生成调试信息
+                debug_info = generate_debug_info(current_state)
+                
+                # 返回最新的消息
+                yield {
+                    "session_id": session_id,
+                    "message": last_assistant_message,
+                    "type": "message",
+                    "debug_info": debug_info,
+                    "node": event.get("node", "unknown")
+                }
+            
+            # 更新会话状态
+            SESSION_STATES[session_id] = current_state
+        
+        # 记录处理结束时间并计算耗时
+        end_time = time.time()
+        processing_time = end_time - start_time
+        
+        # 从最终状态获取最后的消息
+        final_state = SESSION_STATES.get(session_id, {})
+        
+        # 获取最后一条助手消息
+        last_assistant_message = None
+        for msg in reversed(final_state.get("messages", [])):
+            if msg.get("role") in ["assistant", "ai"]:
+                last_assistant_message = msg.get("content", "")
+                break
+        
+        if not last_assistant_message:
+            last_assistant_message = "处理完成，但没有生成响应。"
+        
+        # 生成最终的调试信息
+        final_debug_info = generate_debug_info(final_state)
+        final_debug_info["processing_time"] = f"{processing_time:.2f}秒"
+        
+        # 返回最终结果
+        yield {
+            "session_id": session_id,
+            "message": last_assistant_message,
+            "type": "final",
+            "debug_info": final_debug_info,
+            "processing_time": processing_time
+        }
+        
+        # 保存会话状态
+        await save_session_state(session_id, final_state)
+        
+    except Exception as e:
+        logger.error(f"流式处理消息时出错: {str(e)}", exc_info=True)
+        
+        # 返回错误信息
+        yield {
+            "session_id": session_id,
+            "message": f"处理消息时出错: {str(e)}",
+            "type": "error",
+            "error": str(e),
+            "debug_info": {
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            }
+        }
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "stream_processing_error",
+            "component": "astream_message",
+            "error_message": str(e),
+            "session_id": session_id
+        })
+
+async def api_get_metrics_dashboard() -> Dict[str, Any]:
+    """获取业务指标仪表板的API接口
+    
+    生成并返回包含各项业务指标的仪表板数据
+    
+    Returns:
+        包含业务指标的仪表板数据
+    """
+    try:
+        # 生成指标仪表板
+        dashboard = generate_metrics_dashboard()
+        
+        # 创建快照
+        snapshot_path = ""
+        if metrics_monitor:
+            snapshot_path = metrics_monitor.create_snapshot()
+            
+        # 记录API访问指标
+        record_business_metric("api_metrics_access", 1, {
+            "timestamp": time.time(),
+            "snapshot": os.path.basename(snapshot_path) if snapshot_path else "none"
+        })
+        
+        return {
+            "status": "success",
+            "data": dashboard,
+            "snapshot": os.path.basename(snapshot_path) if snapshot_path else None,
+            "timestamp": time.time()
+        }
+    except Exception as e:
+        logger.error(f"获取指标仪表板失败: {str(e)}", exc_info=True)
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "api_error",
+            "component": "api_get_metrics_dashboard",
+            "error_message": str(e)
+        })
+        
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": time.time()
+        }
+
+
+async def api_get_session_metrics(session_id: str) -> Dict[str, Any]:
+    """获取特定会话的指标数据
+    
+    返回特定会话的详细指标数据
+    
+    Args:
+        session_id: 会话ID
+        
+    Returns:
+        包含会话指标的字典
+    """
+    try:
+        # 检查会话是否存在
+        state = SESSION_STATES.get(session_id)
+        if not state:
+            return {
+                "status": "error",
+                "error": f"会话不存在: {session_id}",
+                "timestamp": time.time()
+            }
+        
+        # 生成会话指标
+        session_data = {
+            "session_id": session_id,
+            "created_at": state.get("created_at"),
+            "last_updated_at": state.get("last_updated_at"),
+            "age": calculate_session_age(state.get("created_at", "")),
+            "message_count": len(state.get("messages", [])),
+            "current_intent": state.get("current_intent", {}).get("name", "无") if state.get("current_intent") else "无",
+            "slots_count": len(state.get("slots", {})),
+            "error_count": state.get("business_metrics", {}).get("error_counts", 0),
+            "human_interventions": state.get("business_metrics", {}).get("human_interventions", 0),
+            "breakpoints_triggered": len(state.get("breakpoint_history", [])),
+            "business_metrics": state.get("business_metrics", {})
+        }
+        
+        # 如果有指标监控器，获取该会话的聚合指标
+        if metrics_monitor:
+            # 获取过去1小时内该会话的指标数据
+            one_hour_ago = time.time() - 3600
+            
+            # 过滤出该会话的消息计数
+            session_messages = []
+            for value in metrics_monitor.get_metric_history("message_count", one_hour_ago):
+                if value.metadata.get("session_id") == session_id:
+                    session_messages.append(value)
+            
+            # 过滤出该会话的错误计数
+            session_errors = []
+            for value in metrics_monitor.get_metric_history("error_count", one_hour_ago):
+                if value.metadata.get("session_id") == session_id:
+                    session_errors.append(value)
+            
+            # 添加到会话数据
+            session_data["metrics"] = {
+                "recent_message_count": len(session_messages),
+                "recent_error_count": len(session_errors),
+                "recent_activity": bool(session_messages)
+            }
+        
+        # 记录API访问指标
+        record_business_metric("api_session_metrics_access", 1, {
+            "session_id": session_id,
+            "timestamp": time.time()
+        })
+        
+        return {
+            "status": "success",
+            "data": session_data,
+            "timestamp": time.time()
+        }
+    except Exception as e:
+        logger.error(f"获取会话指标失败: {str(e)}", exc_info=True)
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "api_error",
+            "component": "api_get_session_metrics",
+            "error_message": str(e),
+            "session_id": session_id
+        })
+        
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": time.time()
+        }
+
+
+async def api_get_active_sessions() -> Dict[str, Any]:
+    """获取活跃会话列表
+    
+    返回所有活跃会话的列表及其基本信息
+    
+    Returns:
+        包含活跃会话信息的字典
+    """
+    try:
+        # 获取所有会话
+        sessions = []
+        for session_id, state in SESSION_STATES.items():
+            # 计算最后活动时间
+            last_updated = state.get("last_updated_at", "")
+            if last_updated:
+                try:
+                    last_updated_time = datetime.fromisoformat(last_updated)
+                    last_active_seconds = (datetime.now() - last_updated_time).total_seconds()
+                except:
+                    last_active_seconds = float('inf')
+            else:
+                last_active_seconds = float('inf')
+            
+            # 只包含24小时内活跃的会话
+            if last_active_seconds < 86400:  # 24小时
+                sessions.append({
+                    "session_id": session_id,
+                    "created_at": state.get("created_at", ""),
+                    "last_updated_at": last_updated,
+                    "last_active_seconds": last_active_seconds,
+                    "message_count": len(state.get("messages", [])),
+                    "current_intent": state.get("current_intent", {}).get("name", "无") if state.get("current_intent") else "无",
+                    "status": state.get("status", "unknown"),
+                    "has_error": bool(state.get("error"))
+                })
+        
+        # 按最后活动时间排序
+        sessions.sort(key=lambda s: s.get("last_active_seconds", float('inf')))
+        
+        # 记录API访问指标
+        record_business_metric("api_active_sessions_access", 1, {
+            "timestamp": time.time(),
+            "session_count": len(sessions)
+        })
+        
+        return {
+            "status": "success",
+            "count": len(sessions),
+            "sessions": sessions,
+            "timestamp": time.time()
+        }
+    except Exception as e:
+        logger.error(f"获取活跃会话失败: {str(e)}", exc_info=True)
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "api_error",
+            "component": "api_get_active_sessions",
+            "error_message": str(e)
+        })
+        
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": time.time()
+        }
+
+async def report_base_handler(state: EnhancedAgentState, report_type: str) -> EnhancedAgentState:
+    """报表处理基础函数
+    
+    处理各类报表请求的基础函数，包含共享的逻辑和流程
+    
+    Args:
+        state: 当前状态
+        report_type: 报表类型 (financial, project, sales, hr)
+        
+    Returns:
+        更新后的状态
+    """
+    # 记录开始时间
+    start_time = time.time()
+    
+    # 复制状态
+    new_state = state.copy()
+    
+    # 获取会话ID
+    session_id = new_state.get("session_id", "default-session")
+    
+    # 记录报表请求
+    record_business_metric(f"report_{report_type}_requested", 1, {
+        "session_id": session_id,
+        "timestamp": time.time()
+    })
+    
+    # 获取用户槽位
+    slots = new_state.get("slots", {})
+    
+    # 确定时间范围
+    time_range = slots.get("time_range", "last_month")
+    time_period_start = slots.get("start_date")
+    time_period_end = slots.get("end_date")
+    
+    # 验证参数
+    if not time_range and not (time_period_start and time_period_end):
+        # 如果没有指定时间范围和具体日期，使用默认的上个月
+        time_range = "last_month"
+        
+        # 更新状态中的槽位
+        if "slots" not in new_state:
+            new_state["slots"] = {}
+        new_state["slots"]["time_range"] = time_range
+        
+        # 添加说明消息
+        new_state["messages"].append({
+            "role": "assistant",
+            "content": f"我将为您生成{report_type}报表，使用默认时间范围: 上个月。"
+        })
+    
+    # 准备报表参数
+    report_params = {
+        "report_type": report_type,
+        "time_range": time_range,
+        "time_period_start": time_period_start,
+        "time_period_end": time_period_end,
+        "filters": slots.get("filters", {}),
+        "format": slots.get("format", "summary"),
+        "detail_level": slots.get("detail_level", "medium"),
+        "session_id": session_id,
+        "timestamp": time.time()
+    }
+    
+    # 记录该类型报表生成参数（用于分析用户偏好）
+    record_business_metric(f"report_{report_type}_parameters", 1, report_params)
+    
+    try:
+        # 执行知识检索来获取相关数据
+        # 构建检索查询
+        retrieval_query = f"Generate {report_type} report for {time_range}"
+        if time_period_start and time_period_end:
+            retrieval_query += f" from {time_period_start} to {time_period_end}"
+        
+        # 记录开始检索
+        logger.info(f"执行报表相关知识检索: {retrieval_query}")
+        
+        # 执行检索
+        retrieval_results = await retrieve_with_memory(
+            query=retrieval_query,
+            session_id=session_id,
+            top_k=5  # 获取前5个最相关的结果
+        )
+        
+        # 更新检索结果
+        formatted_results = format_retrieval_results(retrieval_results)
+        new_state["retrieval_results"] = formatted_results
+        
+        # 检索质量评估
+        retrieval_quality = 0.0
+        if retrieval_results:
+            top_score = retrieval_results[0].score if retrieval_results else 0
+            retrieval_quality = min(1.0, top_score * 1.2)  # 归一化到0-1
+            
+            # 基于结果数量调整质量
+            result_count_factor = min(1.0, len(retrieval_results) / 3)
+            retrieval_quality = retrieval_quality * 0.8 + result_count_factor * 0.2
+        
+        # 记录检索指标
+        record_business_metric("knowledge_retrieval_quality", retrieval_quality, {
+            "purpose": f"{report_type}_report",
+            "session_id": session_id,
+            "result_count": len(retrieval_results) if retrieval_results else 0
+        })
+        
+        # 检查检索结果是否足够
+        if not retrieval_results or len(retrieval_results) < 2:
+            if new_state["confidence"] > 0.7:  # 如果整体置信度高，仍继续生成
+                new_state["messages"].append({
+                    "role": "assistant",
+                    "content": f"我找到的{report_type}报表相关数据有限，但我会尽力为您生成报表。"
+                })
+            else:
+                # 置信度不高，请求更多信息
+                new_state["messages"].append({
+                    "role": "assistant",
+                    "content": f"很抱歉，我没有找到足够的数据来生成{report_type}报表。请提供更多具体信息，例如时间范围或特定的报表需求。"
+                })
+                
+                # 更新状态
+                new_state["status"] = "need_more_info"
+                new_state["next_step"] = "slot_filler"
+                
+                # 记录处理时间
+                processing_time = time.time() - start_time
+                record_business_metric("response_time", processing_time, {
+                    "component": "report_base_handler",
+                    "report_type": report_type,
+                    "outcome": "insufficient_data",
+                    "session_id": session_id
+                })
+                
+                return new_state
+        
+        # 构建报表上下文
+        report_context = {
+            "report_type": report_type,
+            "time_range": time_range,
+            "time_period_start": time_period_start,
+            "time_period_end": time_period_end,
+            "retrieval_results": formatted_results,
+            "detail_level": slots.get("detail_level", "medium"),
+            "format": slots.get("format", "summary")
+        }
+        
+        # 根据报表类型更新状态
+        new_state["report_context"] = report_context
+        new_state["status"] = "report_ready"
+        
+        # 计算处理时间
+        processing_time = time.time() - start_time
+        
+        # 记录处理时间指标
+        record_business_metric("response_time", processing_time, {
+            "component": "report_base_handler",
+            "report_type": report_type,
+            "outcome": "success",
+            "retrieval_quality": retrieval_quality,
+            "session_id": session_id
+        })
+        
+        return new_state
+    
+    except Exception as e:
+        logger.error(f"报表处理过程中出错: {str(e)}")
+        new_state["error"] = f"生成{report_type}报表失败: {str(e)}"
+        new_state["status"] = "error"
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "report_generation_error",
+            "component": "report_base_handler",
+            "report_type": report_type,
+            "error_message": str(e),
+            "session_id": session_id
+        })
+        
+        # 计算处理时间
+        processing_time = time.time() - start_time
+        
+        # 记录处理时间指标
+        record_business_metric("response_time", processing_time, {
+            "component": "report_base_handler",
+            "report_type": report_type,
+            "outcome": "error",
+            "session_id": session_id
+        })
+        
+        return new_state
+
+async def financial_report_handler_impl(state: EnhancedAgentState) -> EnhancedAgentState:
+    """财务报表处理实现
+    
+    生成财务报表内容
+    
+    Args:
+        state: 当前状态
+        
+    Returns:
+        更新后的状态
+    """
+    # 记录开始时间
+    start_time = time.time()
+    
+    # 复制状态
+    new_state = state.copy()
+    
+    # 获取会话ID
+    session_id = new_state.get("session_id", "default-session")
+    
+    # 获取报表上下文
+    report_context = new_state.get("report_context", {})
+    if not report_context:
+        # 如果没有报表上下文，返回错误
+        new_state["error"] = "缺少报表上下文，无法生成财务报表"
+        new_state["status"] = "error"
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "missing_report_context",
+            "component": "financial_report_handler",
+            "session_id": session_id
+        })
+        
+        return new_state
+    
+    # 获取检索结果
+    retrieval_results = new_state.get("retrieval_results", [])
+    
+    # 获取报表参数
+    time_range = report_context.get("time_range", "last_month")
+    detail_level = report_context.get("detail_level", "medium")
+    report_format = report_context.get("format", "summary")
+    
+    try:
+        # 使用LLM生成报表
+        llm = get_async_llm(temperature=0.1)  # 降低随机性，提高一致性
+        
+        # 构建系统提示
+        system_prompt = f"""
+你是一位专业的财务分析师，正在生成财务报表。请根据提供的信息生成全面且准确的财务报表。
+
+报表时间范围: {time_range}
+详细程度: {detail_level} (low=仅关键指标, medium=标准报表, high=详细分析)
+格式: {report_format} (summary=摘要形式, table=表格形式, analysis=带分析的报表)
+
+以下是相关信息:
+"""
+        
+        # 添加检索结果
+        if retrieval_results:
+            for i, result in enumerate(retrieval_results):
+                system_prompt += f"\n来源 {i+1}:\n{result['content']}\n"
+        else:
+            system_prompt += "\n没有找到特定的财务数据，请生成一份基于通用财务报表结构的示例报表。"
+        
+        # 添加指导信息
+        system_prompt += """
+报表应当包含以下部分:
+1. 收入概览
+2. 支出分析
+3. 利润率分析
+4. 现金流状况
+5. 关键财务指标 (ROI, ROA, 负债比率等)
+6. 趋势分析和对比
+7. 风险评估
+8. 结论和建议
+
+对于财务数据，请确保:
+- 数据精确到小数点后两位
+- 大额数字使用适当的单位（千、百万、亿等）
+- 提供同比和环比变化百分比
+- 对于关键变化，提供简要解释
+
+根据详细程度和格式调整内容长度和深度。输出应当结构清晰，便于理解。
+"""
+        
+        # 准备用户消息
+        user_message = f"请生成一份{time_range}的财务报表，{detail_level}详细程度，使用{report_format}格式。"
+        
+        # 准备消息列表
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ]
+        
+        # 调用LLM
+        response = await llm.ainvoke(messages)
+        report_content = response.content
+        
+        # 添加报表到消息
+        new_state["messages"].append({
+            "role": "assistant",
+            "content": f"以下是您请求的财务报表:\n\n{report_content}"
+        })
+        
+        # 更新状态
+        new_state["status"] = "completed"
+        new_state["next_step"] = "user_input_processor"
+        
+        # 保存报表内容到状态
+        if "generated_reports" not in new_state:
+            new_state["generated_reports"] = {}
+        
+        report_id = f"financial_{int(time.time())}"
+        new_state["generated_reports"][report_id] = {
+            "type": "financial",
+            "content": report_content,
+            "parameters": report_context,
+            "timestamp": time.time(),
+            "quality_score": None  # 将在用户反馈后填充
+        }
+        
+        # 计算处理时间
+        processing_time = time.time() - start_time
+        
+        # 评估报表质量
+        # 1. 长度检查 (简单启发式方法)
+        length_score = min(1.0, len(report_content) / 1500)
+        
+        # 2. 结构完整性检查 (检查是否包含所有必要部分)
+        required_sections = [
+            "收入", "支出", "利润", "现金流", "指标", "趋势", "风险", "结论"
+        ]
+        
+        structure_score = sum(1 for section in required_sections if section in report_content) / len(required_sections)
+        
+        # 3. 数字密度检查 (财务报表应包含足够的数字)
+        import re
+        numeric_matches = re.findall(r'\d+\.?\d*%?', report_content)
+        numeric_density = min(1.0, len(numeric_matches) / 30)  # 假设至少需要30个数字
+        
+        # 计算综合质量分数
+        quality_score = (length_score * 0.3) + (structure_score * 0.5) + (numeric_density * 0.2)
+        
+        # 记录质量分数
+        record_business_metric("report_quality", quality_score, {
+            "report_type": "financial",
+            "report_id": report_id,
+            "length_score": length_score,
+            "structure_score": structure_score,
+            "numeric_density": numeric_density,
+            "session_id": session_id,
+            "processing_time": processing_time
+        })
+        
+        # 更新报表质量分数
+        new_state["generated_reports"][report_id]["quality_score"] = quality_score
+        
+        # 记录处理时间
+        record_business_metric("response_time", processing_time, {
+            "component": "financial_report_handler",
+            "outcome": "success",
+            "session_id": session_id,
+            "report_quality": quality_score
+        })
+        
+        # 记录报表生成完成
+        record_business_metric("report_financial_completed", 1, {
+            "session_id": session_id,
+            "time_range": time_range,
+            "detail_level": detail_level,
+            "format": report_format,
+            "quality_score": quality_score,
+            "processing_time": processing_time
+        })
+        
+        return new_state
+    
+    except Exception as e:
+        logger.error(f"生成财务报表时出错: {str(e)}")
+        new_state["error"] = f"生成财务报表失败: {str(e)}"
+        new_state["status"] = "error"
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "financial_report_generation_error",
+            "component": "financial_report_handler",
+            "error_message": str(e),
+            "session_id": session_id
+        })
+        
+        # 计算处理时间
+        processing_time = time.time() - start_time
+        
+        # 记录处理时间
+        record_business_metric("response_time", processing_time, {
+            "component": "financial_report_handler",
+            "outcome": "error",
+            "session_id": session_id
+        })
+        
+        return new_state
+
+async def process_report_feedback(state: EnhancedAgentState, feedback: Dict[str, Any]) -> EnhancedAgentState:
+    """处理用户对报表的反馈
+    
+    记录用户反馈意见，并更新相关业务指标
+    
+    Args:
+        state: 当前状态
+        feedback: 用户反馈信息，包含report_id, rating, comments等
+        
+    Returns:
+        更新后的状态
+    """
+    # 复制状态
+    new_state = state.copy()
+    
+    # 获取会话ID
+    session_id = new_state.get("session_id", "default-session")
+    
+    # 提取反馈数据
+    report_id = feedback.get("report_id")
+    rating = feedback.get("rating")  # 1-5分评价
+    comments = feedback.get("comments", "")
+    
+    # 参数验证
+    if not report_id or report_id not in new_state.get("generated_reports", {}):
+        # 如果报表ID无效，添加错误消息
+        new_state["messages"].append({
+            "role": "system",
+            "content": "无法处理您的反馈，找不到对应的报表。"
+        })
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "invalid_report_id",
+            "component": "process_report_feedback",
+            "session_id": session_id
+        })
+        
+        return new_state
+    
+    # 获取报表信息
+    report_info = new_state["generated_reports"][report_id]
+    report_type = report_info.get("type", "unknown")
+    
+    try:
+        # 记录用户反馈
+        if "feedback" not in report_info:
+            report_info["feedback"] = []
+        
+        # 添加反馈记录
+        feedback_entry = {
+            "timestamp": time.time(),
+            "rating": rating,
+            "comments": comments
+        }
+        
+        report_info["feedback"].append(feedback_entry)
+        
+        # 记录反馈指标
+        if rating is not None:
+            record_business_metric("report_feedback", rating, {
+                "report_type": report_type,
+                "report_id": report_id,
+                "has_comments": bool(comments),
+                "session_id": session_id
+            })
+        
+        # 如果评分低于3分，记录问题报表指标
+        if rating is not None and rating < 3:
+            record_business_metric("report_issue", 1, {
+                "report_type": report_type,
+                "report_id": report_id,
+                "rating": rating,
+                "has_comments": bool(comments),
+                "session_id": session_id
+            })
+        
+        # 添加感谢消息
+        new_state["messages"].append({
+            "role": "assistant",
+            "content": "感谢您的反馈！我们将不断改进报表生成质量。"
+        })
+        
+        # 记录反馈处理
+        record_business_metric("report_feedback_processed", 1, {
+            "report_type": report_type,
+            "session_id": session_id
+        })
+        
+        # 如果评分较低且有评论，尝试提取具体问题并提供改进方向
+        if rating is not None and rating < 4 and comments:
+            await analyze_feedback_for_improvement(report_type, rating, comments, session_id)
+        
+        return new_state
+    
+    except Exception as e:
+        logger.error(f"处理报表反馈时出错: {str(e)}")
+        
+        # 添加错误消息
+        new_state["messages"].append({
+            "role": "system",
+            "content": "处理您的反馈时出现问题，但我们已记录您的意见。"
+        })
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "feedback_processing_error",
+            "component": "process_report_feedback",
+            "error_message": str(e),
+            "session_id": session_id
+        })
+        
+        return new_state
+
+
+async def analyze_feedback_for_improvement(report_type: str, rating: int, comments: str, session_id: str) -> None:
+    """分析用户反馈以提供改进建议
+    
+    从用户评论中提取具体问题，并建议改进方向
+    
+    Args:
+        report_type: 报表类型
+        rating: 评分(1-5)
+        comments: 用户评论
+        session_id: 会话ID
+    """
+    try:
+        # 使用LLM分析反馈
+        llm = get_async_llm(temperature=0)
+        
+        # 准备系统提示
+        system_prompt = f"""
+分析以下关于{report_type}报表的用户反馈（评分{rating}/5分），并提取具体问题和改进方向。
+返回JSON格式:
+{{
+    "issues": [具体问题列表],
+    "improvements": [改进建议列表],
+    "priority": "high|medium|low"  // 基于严重程度的优先级
+}}
+"""
+        
+        # 准备消息
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": comments}
+        ]
+        
+        # 调用LLM
+        response = await llm.ainvoke(messages)
+        
+        try:
+            # 解析结果
+            result = json.loads(response.content)
+            
+            # 记录分析结果
+            record_business_metric("feedback_analysis", 1, {
+                "report_type": report_type,
+                "issues_count": len(result.get("issues", [])),
+                "priority": result.get("priority", "medium"),
+                "session_id": session_id
+            })
+            
+            # 针对每个问题记录详细指标
+            for issue in result.get("issues", []):
+                # 记录具体问题
+                record_business_metric("report_specific_issue", 1, {
+                    "report_type": report_type,
+                    "issue": issue[:100],  # 限制长度
+                    "rating": rating,
+                    "priority": result.get("priority", "medium"),
+                    "session_id": session_id
+                })
+        
+        except json.JSONDecodeError:
+            logger.warning(f"无法解析反馈分析结果: {response.content}")
+    
+    except Exception as e:
+        logger.error(f"分析报表反馈时出错: {str(e)}")
+        # 出错时记录但不中断流程
+
+async def api_get_generated_reports(session_id: Optional[str] = None) -> Dict[str, Any]:
+    """获取已生成报表列表
+    
+    返回系统中已生成的报表列表，可按会话ID筛选
+    
+    Args:
+        session_id: 可选的会话ID筛选条件
+        
+    Returns:
+        报表列表数据
+    """
+    try:
+        # 获取所有会话状态
+        reports_data = []
+        
+        for sid, state in SESSION_STATES.items():
+            # 如果指定了会话ID且不匹配，则跳过
+            if session_id and sid != session_id:
+                continue
+            
+            # 获取该会话中的报表
+            generated_reports = state.get("generated_reports", {})
+            
+            for report_id, report_info in generated_reports.items():
+                # 提取报表基本信息
+                report_data = {
+                    "report_id": report_id,
+                    "session_id": sid,
+                    "type": report_info.get("type", "unknown"),
+                    "timestamp": report_info.get("timestamp"),
+                    "created_at": datetime.fromtimestamp(report_info.get("timestamp", 0)).strftime("%Y-%m-%d %H:%M:%S") if report_info.get("timestamp") else "未知",
+                    "quality_score": report_info.get("quality_score"),
+                    "parameters": report_info.get("parameters", {}),
+                    "has_feedback": bool(report_info.get("feedback"))
+                }
+                
+                reports_data.append(report_data)
+        
+        # 按时间戳排序（最新的在前）
+        reports_data.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+        
+        # 记录API访问
+        record_business_metric("api_reports_list_access", 1, {
+            "session_id": session_id or "all",
+            "report_count": len(reports_data)
+        })
+        
+        return {
+            "status": "success",
+            "count": len(reports_data),
+            "reports": reports_data,
+            "timestamp": time.time()
+        }
+    except Exception as e:
+        logger.error(f"获取报表列表失败: {str(e)}", exc_info=True)
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "api_error",
+            "component": "api_get_generated_reports",
+            "error_message": str(e),
+            "session_id": session_id or "all"
+        })
+        
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": time.time()
+        }
+
+
+async def api_get_report_details(report_id: str, session_id: str) -> Dict[str, Any]:
+    """获取报表详情
+    
+    返回特定报表的详细信息，包括内容和反馈
+    
+    Args:
+        report_id: 报表ID
+        session_id: 会话ID
+        
+    Returns:
+        报表详情数据
+    """
+    try:
+        # 获取会话状态
+        state = SESSION_STATES.get(session_id)
+        
+        if not state:
+            return {
+                "status": "error",
+                "error": f"会话不存在: {session_id}",
+                "timestamp": time.time()
+            }
+        
+        # 获取报表信息
+        generated_reports = state.get("generated_reports", {})
+        
+        if report_id not in generated_reports:
+            return {
+                "status": "error",
+                "error": f"报表不存在: {report_id}",
+                "timestamp": time.time()
+            }
+        
+        # 获取报表详情
+        report_info = generated_reports[report_id]
+        
+        # 构建详细响应
+        report_details = {
+            "report_id": report_id,
+            "session_id": session_id,
+            "type": report_info.get("type", "unknown"),
+            "timestamp": report_info.get("timestamp"),
+            "created_at": datetime.fromtimestamp(report_info.get("timestamp", 0)).strftime("%Y-%m-%d %H:%M:%S") if report_info.get("timestamp") else "未知",
+            "quality_score": report_info.get("quality_score"),
+            "parameters": report_info.get("parameters", {}),
+            "content": report_info.get("content", ""),
+            "feedback": report_info.get("feedback", [])
+        }
+        
+        # 记录API访问
+        record_business_metric("api_report_details_access", 1, {
+            "session_id": session_id,
+            "report_id": report_id,
+            "report_type": report_info.get("type", "unknown")
+        })
+        
+        return {
+            "status": "success",
+            "report": report_details,
+            "timestamp": time.time()
+        }
+    except Exception as e:
+        logger.error(f"获取报表详情失败: {str(e)}", exc_info=True)
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "api_error",
+            "component": "api_get_report_details",
+            "error_message": str(e),
+            "report_id": report_id,
+            "session_id": session_id
+        })
+        
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": time.time()
+        }
+
+
+async def api_submit_report_feedback(report_id: str, session_id: str, feedback: Dict[str, Any]) -> Dict[str, Any]:
+    """提交报表反馈
+    
+    处理用户对报表的反馈评价
+    
+    Args:
+        report_id: 报表ID
+        session_id: 会话ID
+        feedback: 反馈信息，包含rating和comments
+        
+    Returns:
+        处理结果
+    """
+    try:
+        # 获取会话状态
+        state = SESSION_STATES.get(session_id)
+        
+        if not state:
+            return {
+                "status": "error",
+                "error": f"会话不存在: {session_id}",
+                "timestamp": time.time()
+            }
+        
+        # 准备反馈数据
+        feedback_data = {
+            "report_id": report_id,
+            "rating": feedback.get("rating"),
+            "comments": feedback.get("comments", "")
+        }
+        
+        # 处理反馈
+        updated_state = await process_report_feedback(state, feedback_data)
+        
+        # 更新会话状态
+        SESSION_STATES[session_id] = updated_state
+        
+        # 保存会话状态
+        await save_session_state(session_id, updated_state)
+        
+        return {
+            "status": "success",
+            "message": "反馈已处理",
+            "timestamp": time.time()
+        }
+    except Exception as e:
+        logger.error(f"提交报表反馈失败: {str(e)}", exc_info=True)
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "api_error",
+            "component": "api_submit_report_feedback",
+            "error_message": str(e),
+            "report_id": report_id,
+            "session_id": session_id
+        })
+        
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": time.time()
+        }
+
+
+async def api_generate_report(report_type: str, parameters: Dict[str, Any], session_id: Optional[str] = None) -> Dict[str, Any]:
+    """生成新报表
+    
+    通过API接口生成新的报表
+    
+    Args:
+        report_type: 报表类型 (financial, project, sales, hr)
+        parameters: 报表参数
+        session_id: 可选的会话ID，如未提供将创建新会话
+        
+    Returns:
+        报表生成结果
+    """
+    try:
+        # 验证报表类型
+        valid_report_types = ["financial", "project", "sales", "hr"]
+        if report_type not in valid_report_types:
+            return {
+                "status": "error",
+                "error": f"不支持的报表类型: {report_type}。支持的类型: {', '.join(valid_report_types)}",
+                "timestamp": time.time()
+            }
+        
+        # 处理会话ID
+        if not session_id:
+            session_id = f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        
+        # 获取或创建会话状态
+        state = SESSION_STATES.get(session_id)
+        if not state:
+            state = initialize_state()
+            state["session_id"] = session_id
+            state["created_at"] = datetime.now().isoformat()
+            SESSION_STATES[session_id] = state
+        
+        # 更新状态
+        state["last_updated_at"] = datetime.now().isoformat()
+        
+        # 准备槽位
+        if "slots" not in state:
+            state["slots"] = {}
+        
+        # 添加报表参数到槽位
+        state["slots"].update(parameters)
+        
+        # 构建虚拟用户请求
+        user_message = f"请生成一份{report_type}报表"
+        if "time_range" in parameters:
+            user_message += f"，时间范围为{parameters['time_range']}"
+        if "detail_level" in parameters:
+            user_message += f"，详细程度为{parameters['detail_level']}"
+        
+        # 添加用户消息
+        state["messages"].append({
+            "role": "human",
+            "content": user_message,
+            "timestamp": datetime.now().isoformat(),
+            "source": "api"
+        })
+        
+        # 设置意图
+        state["current_intent"] = {
+            "name": f"query_{report_type}_report",
+            "confidence": 1.0,
+            "slots": parameters,
+            "parameters": {}  # 可以根据需要填充
+        }
+        
+        # 执行报表处理
+        # 1. 基础处理
+        state = await report_base_handler(state, report_type)
+        
+        # 2. 类型特定处理
+        handler_map = {
+            "financial": financial_report_handler_impl,
+            "project": project_report_handler_impl,
+            "sales": sales_report_handler_impl,
+            "hr": hr_report_handler_impl
+        }
+        
+        if state.get("status") == "report_ready":
+            handler = handler_map.get(report_type)
+            if handler:
+                state = await handler(state)
+        
+        # 更新会话状态
+        SESSION_STATES[session_id] = state
+        
+        # 保存会话状态
+        await save_session_state(session_id, state)
+        
+        # 查找生成的报表ID
+        report_id = None
+        for rid, rinfo in state.get("generated_reports", {}).items():
+            if rinfo.get("type") == report_type and int(time.time()) - int(rinfo.get("timestamp", 0)) < 60:
+                report_id = rid
+                break
+        
+        # 返回结果
+        if report_id:
+            return {
+                "status": "success",
+                "message": "报表已生成",
+                "session_id": session_id,
+                "report_id": report_id,
+                "timestamp": time.time()
+            }
+        elif state.get("error"):
+            return {
+                "status": "error",
+                "error": state.get("error"),
+                "session_id": session_id,
+                "timestamp": time.time()
+            }
+        else:
+            return {
+                "status": "unknown",
+                "message": "处理完成但未找到生成的报表",
+                "session_id": session_id,
+                "timestamp": time.time()
+            }
+    except Exception as e:
+        logger.error(f"通过API生成报表失败: {str(e)}", exc_info=True)
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "api_error",
+            "component": "api_generate_report",
+            "error_message": str(e),
+            "report_type": report_type,
+            "session_id": session_id or "new"
+        })
+        
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": time.time()
+        }
+
+async def financial_report_handler(state: EnhancedAgentState) -> EnhancedAgentState:
+    """财务报表处理入口
+    
+    处理财务报表请求的主入口函数
+    
+    Args:
+        state: 当前状态
+        
+    Returns:
+        更新后的状态
+    """
+    # 记录业务指标
+    session_id = state.get("session_id", "default-session")
+    record_business_metric("report_handler_called", 1, {
+        "report_type": "financial",
+        "session_id": session_id
+    })
+    
+    try:
+        # 基础报表处理
+        report_state = await report_base_handler(state, "financial")
+        
+        # 如果基础处理出错或需要更多信息，直接返回
+        if report_state.get("error") or report_state.get("status") == "need_more_info":
+            return report_state
+        
+        # 调用实现函数
+        return await financial_report_handler_impl(report_state)
+    except Exception as e:
+        # 记录错误
+        logger.error(f"财务报表处理器出错: {str(e)}")
+        
+        # 复制状态并添加错误信息
+        new_state = state.copy()
+        new_state["error"] = f"财务报表处理失败: {str(e)}"
+        new_state["status"] = "error"
+        
+        # 记录错误指标
+        record_business_metric("error_count", 1, {
+            "error_type": "report_handler_error",
+            "component": "financial_report_handler",
+            "error_message": str(e),
+            "session_id": session_id
+        })
+        
+        return new_state
