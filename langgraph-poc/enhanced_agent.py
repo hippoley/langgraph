@@ -10,6 +10,7 @@ import asyncio
 from datetime import datetime
 from typing import Dict, List, Any, Optional, Union, TypedDict, Literal, Annotated, AsyncIterator
 from dataclasses import dataclass, field, asdict
+import re
 
 # 配置日志
 logging.basicConfig(
@@ -28,6 +29,7 @@ try:
     from business_metrics import BusinessMetricRegistry, create_default_metrics
     from enhanced_rag import EnhancedRetriever, RetrievalResult, create_sample_knowledge_base
     from api_config import get_llm
+    from integration import retrieve_with_memory, format_retrieval_results, update_memory_with_conversation
 except ImportError as e:
     logger.error(f"导入依赖失败: {str(e)}")
     logger.error("请确保已安装所有必要的依赖")
@@ -468,1280 +470,1831 @@ tools = {
 
 # ============== 节点函数 ==============
 
-def user_input_processor(state: EnhancedAgentState) -> EnhancedAgentState:
-    """处理用户输入"""
-    # 获取最新的用户消息
-    user_message = None
-    for msg in reversed(state["messages"]):
-        if msg.get("role") == "user":
-            user_message = msg.get("content", "")
-            break
-    
-    if not user_message:
-        # 如果没有用户消息，不做任何处理
-        return state
-    
-    # 更新状态
-    state["last_updated_at"] = datetime.now().isoformat()
-    state["status"] = "processing_input"
-    
-    # 记录日志
-    logger.info(f"处理用户输入: {user_message[:50]}...")
-    
-    return state
-
-def intent_recognizer(state: EnhancedAgentState) -> EnhancedAgentState:
-    """识别意图"""
-    # 获取最新的用户消息
-    user_message = None
-    for msg in reversed(state["messages"]):
-        if msg.get("role") == "user":
-            user_message = msg.get("content", "")
-            break
-    
-    if not user_message:
-        # 如果没有用户消息，不做任何处理
-        return state
-    
-    # 识别意图
-    intent_name, confidence = intent_manager.identify_intent(user_message)
-    
-    # 如果识别到意图
-    if intent_name:
-        # 检查当前是否有活跃意图
-        if state["current_intent"]:
-            current_intent_name = state["current_intent"].get("name")
-            # 如果意图不同，可能是中断
-            if intent_name != current_intent_name:
-                # 检测是否是中断
-                if intent_manager.is_interruption(user_message):
-                    # 挂起当前意图
-                    current_intent = state["current_intent"].copy()
-                    # 标记为挂起
-                    current_intent["state"] = "suspended"
-                    # 添加到挂起栈
-                    state["suspended_intents"].append(current_intent)
-                    # 清除当前意图
-                    state["current_intent"] = None
-                    
-                    # 记录中断事件
-                    state["context"]["last_interruption"] = {
-                        "intent": current_intent_name,
-                        "time": datetime.now().isoformat()
-                    }
-                    
-                    # 记录日志
-                    logger.info(f"用户中断当前意图: {current_intent_name}")
-        
-        # 如果没有当前意图或已被挂起，设置新意图
-        if not state["current_intent"]:
-            # 获取意图定义
-            intent = intent_manager.intents[intent_name]
-            # 创建新的当前意图
-            state["current_intent"] = {
-                "name": intent_name,
-                "description": intent.description,
-                "confidence": confidence,
-                "state": "active",
-                "slots": {slot.name: None for slot in intent.slots},
-                "handler": intent.handler,
-                "business_metric": intent.business_metric,
-                "created_at": datetime.now().isoformat()
-            }
-            
-            # 添加到意图栈
-            state["intent_stack"].append(state["current_intent"])
-            
-            # 记录日志
-            logger.info(f"识别到新意图: {intent_name} (置信度: {confidence:.2f})")
-    else:
-        # 如果没有识别到明确的意图
-        if not state["current_intent"]:
-            # 设置默认为闲聊意图
-            state["current_intent"] = {
-                "name": "chitchat",
-                "description": "闲聊",
-                "confidence": 0.5,
-                "state": "active",
-                "slots": {},
-                "handler": "handle_chitchat",
-                "business_metric": None,
-                "created_at": datetime.now().isoformat()
-            }
-            
-            # 添加到意图栈
-            state["intent_stack"].append(state["current_intent"])
-            
-            # 记录日志
-            logger.info("未识别到明确意图，默认为闲聊")
-    
-    # 更新状态
-    state["status"] = "intent_recognized"
-    
-    return state
-
-def check_return_to_previous(state: EnhancedAgentState) -> EnhancedAgentState:
-    """检查是否返回到之前的意图"""
-    # 获取最新的用户消息
-    user_message = None
-    for msg in reversed(state["messages"]):
-        if msg.get("role") == "user":
-            user_message = msg.get("content", "")
-            break
-    
-    if not user_message:
-        # 如果没有用户消息，不做任何处理
-        return state
-    
-    # 检查是否是返回之前话题的请求
-    if intent_manager.is_return_to_previous(user_message) and state["suspended_intents"]:
-        # 从挂起栈中恢复最近的意图
-        previous_intent = state["suspended_intents"].pop()
-        
-        # 恢复为当前意图
-        state["current_intent"] = previous_intent
-        
-        # 更新状态
-        state["current_intent"]["state"] = "active"
-        state["current_intent"]["resumed_at"] = datetime.now().isoformat()
-        
-        # 记录日志
-        logger.info(f"返回到之前的意图: {previous_intent['name']}")
-        
-        # 添加系统消息
-        state["messages"].append({
-            "role": "system",
-            "content": f"已返回到关于"{previous_intent['description']}"的话题。"
-        })
-    
-    # 更新状态
-    state["status"] = "checked_return"
-    
-    return state
-
-def slot_filler(state: EnhancedAgentState) -> EnhancedAgentState:
-    """填充槽位"""
-    # 获取当前意图
-    current_intent = state.get("current_intent", {})
-    intent_name = current_intent.get("name")
-    
-    if not intent_name or intent_name not in intent_manager.intents:
-        return state
-    
-    # 获取意图定义
-    intent = intent_manager.intents[intent_name]
-    
-    # 获取最新的用户消息
-    user_message = None
-    for msg in reversed(state["messages"]):
-        if msg.get("role") == "user":
-            user_message = msg.get("content", "")
-            break
-    
-    if not user_message:
-        # 如果没有用户消息，不做任何处理
-        return state
-    
-    # 尝试从用户消息中提取槽位值
-    slots_filled = False
-    
-    # 获取未填充的槽位
-    unfilled_slots = [
-        slot for slot in intent.slots 
-        if slot.required and not current_intent.get("slots", {}).get(slot.name)
-    ]
-    
-    if unfilled_slots:
-        # 获取第一个未填充的槽位
-        slot = unfilled_slots[0]
-        
-        # 尝试提取槽位值
-        slot_value = intent_manager.extract_slot_value(slot, user_message)
-        
-        if slot_value:
-            # 更新槽位值
-            current_intent["slots"][slot.name] = slot_value
-            slots_filled = True
-            
-            # 记录日志
-            logger.info(f"已填充槽位 {slot.name}: {slot_value}")
-    
-    # 检查是否还有未填充的槽位
-    unfilled_required_slots = [
-        slot for slot in intent.slots 
-        if slot.required and not current_intent.get("slots", {}).get(slot.name)
-    ]
-    
-    if unfilled_required_slots:
-        # 获取下一个槽位的提示
-        next_slot = unfilled_required_slots[0]
-        prompt = next_slot.prompt or f"请提供{next_slot.description}"
-        
-        # 添加助手消息，请求槽位值
-        state["messages"].append({
-            "role": "assistant",
-            "content": prompt
-        })
-        
-        # 更新状态
-        state["status"] = "slot_filling"
-    else:
-        # 所有必填槽位已填充
-        state["status"] = "slots_filled"
-    
-    return state
-
-def knowledge_retriever(state: EnhancedAgentState) -> EnhancedAgentState:
-    """检索知识"""
-    # 获取当前意图
-    current_intent = state.get("current_intent", {})
-    intent_name = current_intent.get("name")
-    business_metric = current_intent.get("business_metric")
-    
-    if not intent_name:
-        return state
-    
-    # 获取用户查询
-    user_message = None
-    for msg in reversed(state["messages"]):
-        if msg.get("role") == "user":
-            user_message = msg.get("content", "")
-            break
-    
-    if not user_message:
-        return state
-    
-    # 确定相关的知识源
-    knowledge_sources = []
-    if business_metric:
-        if business_metric == "financial_report":
-            knowledge_sources.append("financial_knowledge")
-        elif business_metric == "project_report":
-            knowledge_sources.append("project_knowledge")
-        elif business_metric == "sales_report":
-            knowledge_sources.append("sales_knowledge")
-        elif business_metric == "hr_report":
-            knowledge_sources.append("hr_knowledge")
-    
-    # 如果没有明确的知识源，尝试通过向量相似度查找
-    if not knowledge_sources and business_metric:
-        metric_name = metric_registry.route_query_to_metric(user_message)
-        if metric_name:
-            if metric_name == "financial_report":
-                knowledge_sources.append("financial_knowledge")
-            elif metric_name == "project_report":
-                knowledge_sources.append("project_knowledge")
-            elif metric_name == "sales_report":
-                knowledge_sources.append("sales_knowledge")
-            elif metric_name == "hr_report":
-                knowledge_sources.append("hr_knowledge")
-    
-    # 如果仍然没有知识源，使用所有知识源
-    if not knowledge_sources:
-        knowledge_sources = [
-            "financial_knowledge",
-            "project_knowledge",
-            "sales_knowledge",
-            "hr_knowledge"
-        ]
-    
-    # 获取对话上下文
-    context = state["messages"][-5:] if len(state["messages"]) > 5 else state["messages"]
-    context_dicts = [
-        {"role": msg.get("role", ""), "content": msg.get("content", "")}
-        for msg in context
-    ]
-    
-    # 执行检索
-    try:
-        results = retriever.retrieve(
-            query=user_message,
-            source_names=knowledge_sources,
-            top_k=3,
-            context=context_dicts
-        )
-        
-        # 重新排序结果
-        results = retriever.rerank_results(
-            query=user_message,
-            results=results,
-            context=context_dicts
-        )
-        
-        # 更新检索结果
-        state["retrieval_results"] = [
-            {
-                "content": result.content,
-                "source": result.source,
-                "relevance": result.relevance,
-                "metadata": result.metadata
-            }
-            for result in results
-        ]
-        
-        # 记录日志
-        logger.info(f"检索到{len(results)}个结果，来自知识源: {', '.join(knowledge_sources)}")
-    except Exception as e:
-        # 记录错误
-        logger.error(f"检索失败: {str(e)}")
-        state["error"] = f"检索失败: {str(e)}"
-    
-    # 更新状态
-    state["status"] = "knowledge_retrieved"
-    
-    return state
-
-def calculator_handler(state: EnhancedAgentState) -> EnhancedAgentState:
-    """处理计算意图"""
-    # 获取当前意图和槽位
-    current_intent = state.get("current_intent", {})
-    slots = current_intent.get("slots", {})
-    
-    # 获取表达式
-    expression = slots.get("expression")
-    
-    if not expression:
-        # 如果没有表达式，请求表达式
-        state["messages"].append({
-            "role": "assistant",
-            "content": "请提供要计算的数学表达式。"
-        })
-        state["status"] = "slot_filling"
-        return state
-    
-    # 计算表达式
-    try:
-        result = tools["calculator"](expression)
-        
-        # 添加响应
-        state["messages"].append({
-            "role": "assistant",
-            "content": f"计算结果: {result}"
-        })
-        
-        # 记录日志
-        logger.info(f"计算表达式: {expression} = {result}")
-    except Exception as e:
-        # 处理错误
-        error_message = f"计算失败: {str(e)}"
-        state["messages"].append({
-            "role": "assistant",
-            "content": error_message
-        })
-        state["error"] = error_message
-        logger.error(error_message)
-    
-    # 更新状态
-    state["status"] = "processed"
-    
-    return state
-
-def weather_handler(state: EnhancedAgentState) -> EnhancedAgentState:
-    """处理天气意图"""
-    # 获取当前意图和槽位
-    current_intent = state.get("current_intent", {})
-    slots = current_intent.get("slots", {})
-    
-    # 获取位置
-    location = slots.get("location")
-    
-    if not location:
-        # 如果没有位置，请求位置
-        state["messages"].append({
-            "role": "assistant",
-            "content": "请问您想查询哪个地方的天气？"
-        })
-        state["status"] = "slot_filling"
-        return state
-    
-    # 获取天气信息
-    try:
-        weather_info = tools["get_weather"](location)
-        
-        # 添加响应
-        state["messages"].append({
-            "role": "assistant",
-            "content": f"{location}的天气: {weather_info}"
-        })
-        
-        # 记录日志
-        logger.info(f"查询天气: {location} - {weather_info}")
-    except Exception as e:
-        # 处理错误
-        error_message = f"获取天气信息失败: {str(e)}"
-        state["messages"].append({
-            "role": "assistant",
-            "content": error_message
-        })
-        state["error"] = error_message
-        logger.error(error_message)
-    
-    # 更新状态
-    state["status"] = "processed"
-    
-    return state
-
-def translate_handler(state: EnhancedAgentState) -> EnhancedAgentState:
-    """处理翻译意图"""
-    # 获取当前意图和槽位
-    current_intent = state.get("current_intent", {})
-    slots = current_intent.get("slots", {})
-    
-    # 获取文本和目标语言
-    text = slots.get("text")
-    target_language = slots.get("target_language")
-    
-    if not text:
-        # 如果没有文本，请求文本
-        state["messages"].append({
-            "role": "assistant",
-            "content": "请提供要翻译的文本。"
-        })
-        state["status"] = "slot_filling"
-        return state
-    
-    if not target_language:
-        # 如果没有目标语言，请求目标语言
-        state["messages"].append({
-            "role": "assistant",
-            "content": "请问您想翻译成哪种语言？（支持中文、英文）"
-        })
-        state["status"] = "slot_filling"
-        return state
-    
-    # 执行翻译
-    try:
-        translated_text = tools["translate"](text, target_language)
-        
-        # 添加响应
-        state["messages"].append({
-            "role": "assistant",
-            "content": f"'{text}'的{target_language}翻译是: {translated_text}"
-        })
-        
-        # 记录日志
-        logger.info(f"翻译: {text} -> {translated_text} ({target_language})")
-    except Exception as e:
-        # 处理错误
-        error_message = f"翻译失败: {str(e)}"
-        state["messages"].append({
-            "role": "assistant",
-            "content": error_message
-        })
-        state["error"] = error_message
-        logger.error(error_message)
-    
-    # 更新状态
-    state["status"] = "processed"
-    
-    return state
-
-def chitchat_handler(state: EnhancedAgentState) -> EnhancedAgentState:
-    """处理闲聊意图"""
-    # 获取最新的用户消息
-    user_message = None
-    for msg in reversed(state["messages"]):
-        if msg.get("role") == "user":
-            user_message = msg.get("content", "")
-            break
-    
-    if not user_message:
-        return state
-    
-    # 使用LLM生成回复
-    try:
-        llm = get_llm()
-        
-        system_prompt = """
-        你是一个友好、礼貌的助手。请针对用户的问候或一般性问题提供简洁、友好的回复。
-        保持简短自然，不要过于正式或机械。
-        """
-        
-        response = llm.invoke([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
-        ])
-        
-        # 添加响应
-        state["messages"].append({
-            "role": "assistant",
-            "content": response.content
-        })
-        
-        # 记录日志
-        logger.info(f"闲聊响应: {response.content[:50]}...")
-    except Exception as e:
-        # 处理错误
-        error_message = f"生成响应失败: {str(e)}"
-        state["messages"].append({
-            "role": "assistant",
-            "content": "抱歉，我现在无法回答您的问题。请稍后再试。"
-        })
-        state["error"] = error_message
-        logger.error(error_message)
-    
-    # 更新状态
-    state["status"] = "processed"
-    
-    return state
-
-def help_handler(state: EnhancedAgentState) -> EnhancedAgentState:
-    """处理帮助意图"""
-    # 生成帮助信息
-    help_message = """
-    我可以帮助您完成以下任务：
-
-    1. 查询报表：
-       - 财务报表：查看收入、支出、利润等财务数据
-       - 项目报表：了解项目进度、资源使用情况等
-       - 销售报表：查看销售数据、客户数量、产品销量等
-       - 人力资源报表：了解人员配置、招聘情况等
-
-    2. 实用工具：
-       - 计算器：计算数学表达式，如"计算2+2"
-       - 天气查询：查询各地天气，如"北京今天天气怎么样"
-       - 翻译：在中英文之间翻译文本
-
-    您可以直接提问，例如"查看上个季度的财务报表"或"北京今天天气怎么样"。
-    如果我需要更多信息，会向您提问。
-    
-    在对话过程中，您可以随时转换话题，之后可以说"回到之前的话题"继续之前的对话。
-    """
-    
-    # 添加响应
-    state["messages"].append({
-        "role": "assistant",
-        "content": help_message
-    })
-    
-    # 记录日志
-    logger.info("提供帮助信息")
-    
-    # 更新状态
-    state["status"] = "processed"
-    
-    return state
-
-def fallback_handler(state: EnhancedAgentState) -> EnhancedAgentState:
-    """处理未知意图"""
-    # 获取最新的用户消息
-    user_message = None
-    for msg in reversed(state["messages"]):
-        if msg.get("role") == "user":
-            user_message = msg.get("content", "")
-            break
-    
-    if not user_message:
-        return state
-    
-    # 使用LLM生成回复
-    try:
-        llm = get_llm()
-        
-        system_prompt = """
-        你是一个友好、礼貌的助手。请针对用户的问题提供一个友好的回复，
-        表示你理解他们的请求，但可能需要更多信息。提供一些可能的帮助选项。
-        """
-        
-        response = llm.invoke([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
-        ])
-        
-        # 添加响应
-        state["messages"].append({
-            "role": "assistant",
-            "content": response.content
-        })
-        
-        # 记录日志
-        logger.info(f"备用处理程序响应: {response.content[:50]}...")
-    except Exception as e:
-        # 处理错误
-        error_message = f"生成响应失败: {str(e)}"
-        state["messages"].append({
-            "role": "assistant",
-            "content": "抱歉，我不太理解您的请求。您可以尝试重新表述，或者输入'帮助'查看我能做什么。"
-        })
-        state["error"] = error_message
-        logger.error(error_message)
-    
-    # 更新状态
-    state["status"] = "processed"
-    
-    return state
-
-def router(state: EnhancedAgentState) -> str:
-    """路由到下一个节点"""
-    # 获取当前意图和状态
-    current_intent = state.get("current_intent", {})
-    current_status = state.get("status", "")
-    
-    # 如果没有当前意图，返回到意图识别
-    if not current_intent:
-        return "intent_recognizer"
-    
-    # 检查是否有未填充的槽位
-    intent_name = current_intent.get("name", "")
-    if intent_name in intent_manager.intents:
-        intent = intent_manager.intents[intent_name]
-        unfilled_required_slots = [
-            slot for slot in intent.slots 
-            if slot.required and not current_intent.get("slots", {}).get(slot.name)
-        ]
-        
-        if unfilled_required_slots:
-            return "slot_filler"
-    
-    # 根据意图进行路由
-    if intent_name == "query_financial_report":
-        return "financial_report_handler"
-    elif intent_name == "query_project_report":
-        return "project_report_handler"
-    elif intent_name == "query_sales_report":
-        return "sales_report_handler"
-    elif intent_name == "query_hr_report":
-        return "hr_report_handler"
-    elif intent_name == "query_weather":
-        return "weather_handler"
-    elif intent_name == "translate":
-        return "translate_handler"
-    elif intent_name == "calculate":
-        return "calculator_handler"
-    elif intent_name == "help":
-        return "help_handler"
-    elif intent_name == "chitchat":
-        return "chitchat_handler"
-    else:
-        return "fallback_handler"
-
-def update_state(state: EnhancedAgentState) -> EnhancedAgentState:
-    """更新状态，完成当前处理"""
-    # 当前意图已经处理完成
-    if state["current_intent"]:
-        state["current_intent"]["state"] = "completed"
-        state["current_intent"]["completed_at"] = datetime.now().isoformat()
+async def user_input_processor(state: EnhancedAgentState) -> EnhancedAgentState:
+    """处理用户输入，准备状态"""
+    # 复制状态
+    new_state = state.copy()
     
     # 更新时间戳
-    state["last_updated_at"] = datetime.now().isoformat()
+    new_state["last_updated_at"] = datetime.now().isoformat()
     
-    # 设置继续标志
-    state["should_continue"] = True
+    # 提取最后一条用户消息
+    user_message = None
+    for msg in reversed(new_state["messages"]):
+        if msg.get("role") == "human":
+            user_message = msg
+            break
+    
+    if not user_message:
+        # 没有找到用户消息，返回错误
+        new_state["error"] = "未找到用户消息"
+        new_state["status"] = "error"
+        return new_state
+    
+    try:
+        # 更新记忆系统
+        session_id = new_state.get("session_id", "default-session")
+        new_state = await update_memory_with_conversation(session_id, new_state)
+        
+        # 检查置信度（用于断点系统）
+        # 计算一个简单的置信度指标：如果消息长度小于10个字符，降低置信度
+        message_content = user_message.get("content", "")
+        if len(message_content) < 10:
+            new_state["confidence"] = 0.6
+        else:
+            new_state["confidence"] = 0.9
+        
+        # 设置状态为已处理
+        new_state["status"] = "user_input_processed"
+        new_state["next_step"] = "intent_recognizer"
+        
+    except Exception as e:
+        # 记录错误
+        logger.error(f"处理用户输入时出错: {str(e)}")
+        new_state["error"] = f"处理用户输入时出错: {str(e)}"
+        new_state["status"] = "error"
+    
+    return new_state
+
+async def intent_recognizer(state: EnhancedAgentState) -> EnhancedAgentState:
+    """意图识别节点
+    
+    识别用户当前的意图
+    
+    Args:
+        state: 当前状态
+        
+    Returns:
+        更新后的状态
+    """
+    new_state = state.copy()
+    
+    # 如果已经有了当前意图，跳过
+    if new_state.get("current_intent") and new_state.get("status") != "need_intent":
+        return new_state
+    
+    # 获取最新的用户消息
+    user_message = ""
+    for msg in reversed(new_state["messages"]):
+        if msg.get("role") == "human":
+            user_message = msg.get("content", "")
+            break
+    
+    if not user_message:
+        # 如果没有找到用户消息
+        new_state["error"] = "无法找到用户消息"
+        new_state["status"] = "error"
+        return new_state
+    
+    try:
+        # 获取意图管理器
+        intent_manager = initialize_components()
+        
+        # 初始化意图识别结果
+        intent_result = None
+        
+        # 首先检查用户是否明确指定了意图
+        explicit_intent = check_explicit_intent(user_message)
+        if explicit_intent:
+            intent_name = explicit_intent
+            # 寻找匹配的预定义意图
+            for intent in intent_manager.intents:
+                if intent.name.lower() == intent_name.lower():
+                    intent_result = {
+                        "name": intent.name,
+                        "confidence": 0.95,  # 明确指定的意图给高置信度
+                        "slots": {},
+                        "parameters": intent.parameters
+                    }
+                    break
+        
+        # 如果没有明确指定，使用意图识别
+        if not intent_result:
+            # 使用异步LLM进行意图识别
+            llm = get_async_llm(temperature=0)
+            
+            # 准备系统提示
+            system_prompt = """
+你是一个专业的意图识别AI。你的任务是分析用户输入并识别出最可能的意图。
+可用的意图有：
+
+{intent_descriptions}
+
+请从以上意图中选择一个最匹配用户输入的，并提取相关参数。回复格式必须是JSON：
+
+{{
+    "intent": "意图名称",
+    "confidence": 置信度（0-1之间的浮点数）,
+    "slots": {{
+        "参数名1": "参数值1",
+        "参数名2": "参数值2"
+    }}
+}}
+
+如果你不确定用户意图，请将"intent"设为"unknown"，并给出较低的置信度。
+"""
+            
+            # 准备意图描述
+            intent_descriptions = "\n".join([
+                f"- {intent.name}: {intent.description}. 参数: {', '.join([f'{p} ({t})' for p, t in intent.parameters.items()])}"
+                for intent in intent_manager.intents
+            ])
+            
+            formatted_prompt = system_prompt.format(intent_descriptions=intent_descriptions)
+            
+            # 调用LLM进行意图识别
+            messages = [
+                {"role": "system", "content": formatted_prompt},
+                {"role": "user", "content": user_message}
+            ]
+            
+            # 使用异步调用
+            response = await llm.ainvoke(messages)
+            response_content = response.content
+            
+            try:
+                # 解析JSON响应
+                intent_data = json.loads(response_content)
+                
+                # 寻找匹配的预定义意图
+                intent_name = intent_data.get("intent")
+                confidence = intent_data.get("confidence", 0.0)
+                slots = intent_data.get("slots", {})
+                
+                if intent_name and intent_name.lower() != "unknown":
+                    for intent in intent_manager.intents:
+                        if intent.name.lower() == intent_name.lower():
+                            intent_result = {
+                                "name": intent.name,
+                                "confidence": confidence,
+                                "slots": slots,
+                                "parameters": intent.parameters
+                            }
+                            break
+            except json.JSONDecodeError:
+                logger.error(f"无法解析意图识别结果: {response_content}")
+                new_state["error"] = "意图识别失败：无法解析结果"
+                new_state["status"] = "error"
+                return new_state
+        
+        # 设置默认意图
+        if not intent_result:
+            # 如果没有识别出意图，使用fallback
+            intent_result = {
+                "name": "fallback",
+                "confidence": 0.3,
+                "slots": {},
+                "parameters": {}
+            }
+        
+        # 更新状态
+        new_state["current_intent"] = intent_result
+        new_state["confidence"] = intent_result["confidence"]
+        
+        # 如果当前槽位为空初始化槽位
+        if "slots" not in new_state or not new_state["slots"]:
+            new_state["slots"] = {}
+        
+        # 合并已识别的槽位到状态中
+        for slot_name, slot_value in intent_result.get("slots", {}).items():
+            new_state["slots"][slot_name] = slot_value
+        
+        # 检查是否有足够的置信度
+        if intent_result["confidence"] < 0.5:
+            # 置信度不足，需要确认
+            new_state["status"] = "need_confirmation"
+            new_state["next_step"] = "confirm_intent"
+        else:
+            # 置信度足够，继续处理
+            new_state["status"] = "intent_recognized"
+            new_state["next_step"] = "slot_filling"
+        
+        return new_state
+        
+    except Exception as e:
+        logger.error(f"意图识别过程中出错: {str(e)}")
+        new_state["error"] = f"意图识别失败: {str(e)}"
+        new_state["status"] = "error"
+        return new_state
+
+async def check_return_to_previous(state: EnhancedAgentState) -> EnhancedAgentState:
+    """检查是否返回到之前的对话
+    
+    检查用户是否想要返回到之前的主题，例如"我们回到之前的话题"
+    
+    Args:
+        state: 当前状态
+        
+    Returns:
+        更新后的状态
+    """
+    new_state = state.copy()
+    
+    # 获取挂起的意图列表
+    suspended_intents = new_state.get("suspended_intents", [])
+    
+    # 如果没有挂起的意图，无需检查
+    if not suspended_intents:
+        new_state["next_step"] = "intent_recognizer"
+        return new_state
+    
+    # 获取最新的用户消息
+    user_message = ""
+    for msg in reversed(new_state["messages"]):
+        if msg.get("role") == "human":
+            user_message = msg.get("content", "")
+            break
+    
+    if not user_message:
+        # 如果没有找到用户消息
+        new_state["error"] = "无法找到用户消息"
+        new_state["status"] = "error"
+        return new_state
+    
+    try:
+        # 检查用户是否想要返回之前的话题
+        # 使用异步LLM
+        llm = get_async_llm(temperature=0)
+        
+        # 准备系统提示
+        system_prompt = f"""
+分析用户消息是否表示想要返回到之前未完成的话题。
+
+你有以下未完成的话题：
+{json.dumps([intent.get('name', 'unknown') for intent in suspended_intents], ensure_ascii=False, indent=2)}
+
+判断用户当前的消息是否表示想要返回到之前的某个话题。
+如果是，返回JSON格式的话题索引，例如 {{"return_to": 0}} 表示返回到第一个话题。
+如果不是，返回 {{"return_to": null}}
+"""
+        
+        # 准备消息
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ]
+        
+        # 请求LLM
+        response = await llm.ainvoke(messages)
+        
+        try:
+            # 解析结果
+            result = json.loads(response.content)
+            return_index = result.get("return_to")
+            
+            if return_index is not None and isinstance(return_index, int) and 0 <= return_index < len(suspended_intents):
+                # 用户想要返回之前的话题
+                resumed_intent = suspended_intents.pop(return_index)
+                
+                # 恢复为当前意图
+                new_state["current_intent"] = resumed_intent
+                
+                # 更新状态
+                new_state["status"] = "intent_resumed"
+                new_state["next_step"] = "slot_filler"
+                
+                # 记录日志
+                logger.info(f"恢复之前的意图: {resumed_intent['name']}")
+                
+                # 添加系统消息
+                new_state["messages"].append({
+                    "role": "system",
+                    "content": f"返回之前的话题: {resumed_intent['name']}"
+                })
+                
+                # 更新挂起的意图列表
+                new_state["suspended_intents"] = suspended_intents
+                
+                return new_state
+                
+        except json.JSONDecodeError as e:
+            logger.error(f"解析返回检查结果时出错: {str(e)}, 响应内容: {response.content}")
+            # 继续处理，不中断流程
+        
+        # 默认继续意图识别
+        new_state["next_step"] = "intent_recognizer"
+        return new_state
+        
+    except Exception as e:
+        logger.error(f"检查返回之前话题时出错: {str(e)}")
+        new_state["error"] = f"检查返回之前话题失败: {str(e)}"
+        new_state["status"] = "error"
+        return new_state
+
+async def slot_filler(state: EnhancedAgentState) -> EnhancedAgentState:
+    """填充槽位节点
+    
+    从用户消息中提取所需的槽位值
+    
+    Args:
+        state: 当前状态
+        
+    Returns:
+        更新后的状态
+    """
+    new_state = state.copy()
+    
+    # 获取当前意图
+    current_intent = new_state.get("current_intent")
+    if not current_intent:
+        # 如果没有当前意图，返回状态
+        new_state["error"] = "没有当前意图，无法填充槽位"
+        new_state["status"] = "error"
+        return new_state
+    
+    # 获取意图的参数
+    parameters = current_intent.get("parameters", {})
+    if not parameters:
+        # 如果没有参数，直接继续
+        new_state["status"] = "slots_filled"
+        new_state["next_step"] = "router"
+        return new_state
+    
+    # 获取已填充的槽位
+    slots = new_state.get("slots", {})
+    if "slots" not in new_state:
+        new_state["slots"] = slots
+    
+    # 查找缺失的必要槽位
+    missing_slots = {}
+    for param_name, param_type in parameters.items():
+        if param_name not in slots or slots[param_name] is None or slots[param_name] == "":
+            missing_slots[param_name] = param_type
+    
+    # 如果没有缺失的槽位，继续
+    if not missing_slots:
+        new_state["status"] = "slots_filled"
+        new_state["next_step"] = "router"
+        return new_state
+    
+    # 获取最新的用户消息
+    user_message = ""
+    for msg in reversed(new_state["messages"]):
+        if msg.get("role") == "human":
+            user_message = msg.get("content", "")
+            break
+    
+    if not user_message:
+        # 如果没有找到用户消息，需要询问用户
+        missing_slot_names = list(missing_slots.keys())
+        first_missing = missing_slot_names[0]
+        
+        # 添加系统消息，要求提供信息
+        new_state["messages"].append({
+            "role": "assistant",
+            "content": f"为了处理您的'{current_intent['name']}'请求，我需要了解{first_missing}。请提供这个信息。"
+        })
+        
+        # 更新状态
+        new_state["status"] = "awaiting_slot"
+        new_state["next_step"] = "slot_filler"
+        return new_state
+    
+    try:
+        # 使用异步LLM提取槽位
+        llm = get_async_llm(temperature=0)
+        
+        # 准备槽位提取提示
+        system_prompt = f"""
+你是一个专业的参数提取AI。从用户的消息中提取以下参数的值：
+
+{json.dumps(missing_slots, ensure_ascii=False, indent=2)}
+
+回复必须是一个JSON对象，包含提取到的参数值。例如：
+{{
+    "参数名1": "参数值1",
+    "参数名2": "参数值2"
+}}
+
+如果无法从用户消息中提取某个参数，将其值设为null。
+"""
+        
+        # 准备消息
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ]
+        
+        # 调用LLM
+        response = await llm.ainvoke(messages)
+        
+        try:
+            # 解析结果
+            extracted_slots = json.loads(response.content)
+            
+            # 更新槽位
+            extracted_count = 0
+            for slot_name, slot_value in extracted_slots.items():
+                if slot_name in missing_slots and slot_value is not None and slot_value != "":
+                    new_state["slots"][slot_name] = slot_value
+                    extracted_count += 1
+            
+            # 检查是否还有缺失的槽位
+            still_missing = {}
+            for param_name in missing_slots:
+                if param_name not in new_state["slots"] or new_state["slots"][param_name] is None or new_state["slots"][param_name] == "":
+                    still_missing[param_name] = missing_slots[param_name]
+            
+            if still_missing and extracted_count == 0:
+                # 如果没有提取到任何槽位，直接询问第一个缺失的槽位
+                missing_slot_names = list(still_missing.keys())
+                first_missing = missing_slot_names[0]
+                
+                # 添加系统消息，要求提供信息
+                new_state["messages"].append({
+                    "role": "assistant",
+                    "content": f"为了处理您的'{current_intent['name']}'请求，我需要了解{first_missing}。请提供这个信息。"
+                })
+                
+                # 更新状态
+                new_state["status"] = "awaiting_slot"
+                new_state["next_step"] = "slot_filler"
+            elif still_missing:
+                # 如果提取到了一些槽位但仍有缺失，继续尝试提取
+                new_state["status"] = "slots_partially_filled"
+                new_state["next_step"] = "slot_filler"
+            else:
+                # 所有槽位已填充
+                new_state["status"] = "slots_filled"
+                new_state["next_step"] = "router"
+            
+            return new_state
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"解析槽位提取结果时出错: {str(e)}, 响应内容: {response.content}")
+            # 如果解析失败，请求用户直接提供第一个缺失的槽位
+            missing_slot_names = list(missing_slots.keys())
+            first_missing = missing_slot_names[0]
+            
+            # 添加系统消息，要求提供信息
+            new_state["messages"].append({
+                "role": "assistant",
+                "content": f"为了处理您的'{current_intent['name']}'请求，我需要了解{first_missing}。请提供这个信息。"
+            })
+            
+            # 更新状态
+            new_state["status"] = "awaiting_slot"
+            new_state["next_step"] = "slot_filler"
+            return new_state
+    
+    except Exception as e:
+        logger.error(f"槽位填充过程中出错: {str(e)}")
+        new_state["error"] = f"槽位填充失败: {str(e)}"
+        new_state["status"] = "error"
+        return new_state
+
+async def knowledge_retriever(state: EnhancedAgentState) -> EnhancedAgentState:
+    """知识检索，根据当前意图和用户查询检索相关信息"""
+    # 复制状态
+    new_state = state.copy()
+    
+    # 获取当前意图和槽位
+    current_intent = new_state.get("current_intent")
+    if not current_intent:
+        # 如果没有当前意图，跳过检索
+        logger.info("无当前意图，跳过知识检索")
+        return new_state
+    
+    intent_name = current_intent.get("name", "")
+    
+    # 对于某些意图，可能不需要检索知识
+    skip_intents = ["calculate", "translate", "help", "chitchat"]
+    if intent_name in skip_intents:
+        logger.info(f"意图 {intent_name} 无需知识检索")
+        return new_state
+    
+    # 构建查询
+    slots = new_state.get("slots", {})
+    messages = new_state.get("messages", [])
+    
+    # 获取最后一条用户消息
+    last_user_message = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "human":
+            last_user_message = msg.get("content", "")
+            break
+    
+    if not last_user_message:
+        logger.warning("未找到用户消息，无法构建查询")
+        return new_state
+    
+    # 使用集成检索模块进行检索
+    try:
+        # 基于意图定制检索参数
+        params = {
+            "top_k": 5,
+            "include_memories": True,
+            "memory_weight": 0.3,
+            "knowledge_weight": 0.7
+        }
+        
+        # 对特定意图进行参数调整
+        if intent_name.startswith("query_"):
+            # 对于查询类意图，增加知识库权重
+            params["knowledge_weight"] = 0.8
+            params["memory_weight"] = 0.2
+        elif "report" in intent_name:
+            # 对于报表类意图，增加记忆权重
+            params["knowledge_weight"] = 0.6
+            params["memory_weight"] = 0.4
+            params["top_k"] = 7  # 增加结果数量
+        
+        # 构建查询
+        query = last_user_message
+        
+        # 如果有槽位信息，可以增强查询
+        if slots:
+            slot_info = ", ".join([f"{k}: {v}" for k, v in slots.items()])
+            query = f"{query} ({slot_info})"
+        
+        # 异步执行检索
+        session_id = new_state.get("session_id", "default-session")
+        results = await retrieve_with_memory(
+            session_id=session_id,
+            query=query,
+            state=new_state,
+            **params
+        )
+        
+        # 更新状态中的检索结果
+        new_state["retrieval_results"] = results.get("retrieval_results", [])
+        
+        # 生成上下文文本
+        context_text = format_retrieval_results(results, include_metadata=False)
+        if context_text:
+            # 添加系统消息，提供检索到的信息
+            new_state["messages"].append({
+                "role": "system",
+                "content": f"已检索到以下相关信息:\n\n{context_text}"
+            })
+            
+            logger.info(f"检索到 {len(results.get('retrieval_results', []))} 条相关信息")
+        else:
+            logger.info("未检索到相关信息")
+        
+        # 设置状态
+        new_state["status"] = "knowledge_retrieved"
+        
+    except Exception as e:
+        logger.error(f"知识检索出错: {str(e)}")
+        # 添加错误信息
+        new_state["error"] = f"知识检索出错: {str(e)}"
+        # 继续流程
+        new_state["status"] = "knowledge_retrieved"
+    
+    return new_state
+
+async def calculator_handler(state: EnhancedAgentState) -> EnhancedAgentState:
+    """处理计算意图"""
+    # 复制状态
+    new_state = state.copy()
+    
+    # 获取槽位
+    slots = new_state.get("slots", {})
+    expression = slots.get("expression", "")
+    
+    if not expression:
+        # 如果没有表达式
+        new_state["messages"].append({
+            "role": "ai",
+            "content": "抱歉，我需要一个表达式来进行计算。请提供一个数学表达式，例如 '2 + 2'。"
+        })
+        new_state["status"] = "missing_expression"
+        return new_state
+    
+    try:
+        # 使用工具进行计算
+        result = Tools.calculator(expression)
+        
+        # 构建响应
+        response = f"计算结果：{expression} = {result}"
+        
+        # 添加响应到消息历史
+        new_state["messages"].append({
+            "role": "ai",
+            "content": response
+        })
+        
+        # 更新状态
+        new_state["status"] = "calculation_completed"
+        
+        # 记录日志
+        logger.info(f"计算完成: {expression} = {result}")
+    
+    except Exception as e:
+        # 处理错误
+        error_message = f"计算时出错: {str(e)}"
+        
+        # 添加错误消息到历史
+        new_state["messages"].append({
+            "role": "ai",
+            "content": f"抱歉，{error_message} 请提供一个有效的数学表达式。"
+        })
+        
+        # 设置错误状态
+        new_state["error"] = error_message
+        new_state["status"] = "calculation_error"
+        
+        # 记录日志
+        logger.error(error_message)
+    
+    return new_state
+
+async def weather_handler(state: EnhancedAgentState) -> EnhancedAgentState:
+    """处理天气查询意图"""
+    # 复制状态
+    new_state = state.copy()
+    
+    # 获取槽位
+    slots = new_state.get("slots", {})
+    location = slots.get("location", "")
+    
+    if not location:
+        # 如果没有位置
+        new_state["messages"].append({
+            "role": "ai",
+            "content": "抱歉，我需要知道您想查询哪个地区的天气。请提供一个位置，例如'北京'。"
+        })
+        new_state["status"] = "missing_location"
+        return new_state
+    
+    try:
+        # 使用工具查询天气
+        weather_info = Tools.get_weather(location)
+        
+        # 构建响应
+        response = f"以下是{location}的天气信息：\n\n{weather_info}"
+        
+        # 添加响应到消息历史
+        new_state["messages"].append({
+            "role": "ai",
+            "content": response
+        })
+        
+        # 更新状态
+        new_state["status"] = "weather_queried"
+        
+        # 记录日志
+        logger.info(f"查询天气完成: {location}")
+    
+    except Exception as e:
+        # 处理错误
+        error_message = f"查询天气时出错: {str(e)}"
+        
+        # 添加错误消息到历史
+        new_state["messages"].append({
+            "role": "ai",
+            "content": f"抱歉，{error_message} 请提供一个有效的位置。"
+        })
+        
+        # 设置错误状态
+        new_state["error"] = error_message
+        new_state["status"] = "weather_query_error"
+        
+        # 记录日志
+        logger.error(error_message)
+    
+    return new_state
+
+async def translate_handler(state: EnhancedAgentState) -> EnhancedAgentState:
+    """处理翻译意图"""
+    # 复制状态
+    new_state = state.copy()
+    
+    # 获取槽位
+    slots = new_state.get("slots", {})
+    text = slots.get("text", "")
+    target_language = slots.get("target_language", "")
+    
+    if not text:
+        # 如果没有文本
+        new_state["messages"].append({
+            "role": "ai",
+            "content": "抱歉，我需要知道您想翻译的文本。请提供需要翻译的内容。"
+        })
+        new_state["status"] = "missing_text"
+        return new_state
+    
+    if not target_language:
+        # 如果没有目标语言
+        new_state["messages"].append({
+            "role": "ai",
+            "content": "抱歉，我需要知道您想翻译成哪种语言。请指定目标语言，例如'英语'、'日语'等。"
+        })
+        new_state["status"] = "missing_target_language"
+        return new_state
+    
+    try:
+        # 使用工具进行翻译
+        translated_text = Tools.translate(text, target_language)
+        
+        # 构建响应
+        response = f"翻译结果：\n\n原文：{text}\n\n译文：{translated_text}"
+        
+        # 添加响应到消息历史
+        new_state["messages"].append({
+            "role": "ai",
+            "content": response
+        })
+        
+        # 更新状态
+        new_state["status"] = "translation_completed"
+        
+        # 记录日志
+        logger.info(f"翻译完成: '{text}' -> '{translated_text}' (目标语言: {target_language})")
+    
+    except Exception as e:
+        # 处理错误
+        error_message = f"翻译时出错: {str(e)}"
+        
+        # 添加错误消息到历史
+        new_state["messages"].append({
+            "role": "ai",
+            "content": f"抱歉，{error_message} 请检查您的文本和目标语言。"
+        })
+        
+        # 设置错误状态
+        new_state["error"] = error_message
+        new_state["status"] = "translation_error"
+        
+        # 记录日志
+        logger.error(error_message)
+    
+    return new_state
+
+async def chitchat_handler(state: EnhancedAgentState) -> EnhancedAgentState:
+    """处理闲聊意图"""
+    # 复制状态
+    new_state = state.copy()
+    
+    # 获取最新的用户消息
+    user_message = None
+    for msg in reversed(new_state["messages"]):
+        if msg.get("role") == "human":
+            user_message = msg.get("content", "")
+            break
+    
+    if not user_message:
+        # 如果没有找到用户消息
+        new_state["messages"].append({
+            "role": "ai",
+            "content": "您好！有什么可以帮助您的吗？"
+        })
+        new_state["status"] = "chitchat_responded"
+        return new_state
+    
+    try:
+        # 使用LLM生成闲聊回复
+        llm = get_llm(temperature=0.7)  # 闲聊使用较高的温度
+        
+        # 收集上下文历史
+        history = []
+        for msg in new_state["messages"][-5:]:  # 仅使用最近5条消息
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            
+            if role == "human":
+                history.append({"role": "user", "content": content})
+            elif role == "ai":
+                history.append({"role": "assistant", "content": content})
+        
+        # 添加系统提示
+        system_prompt = {
+            "role": "system", 
+            "content": "你是一个友好的对话助手。请保持礼貌和有帮助的态度，提供自然、友好的回复。"
+        }
+        
+        # 构建消息
+        messages = [system_prompt] + history
+        
+        # 请求LLM
+        response = await llm.ainvoke(messages)
+        
+        # 获取回复
+        reply = response.content
+        
+        # 添加回复到消息历史
+        new_state["messages"].append({
+            "role": "ai",
+            "content": reply
+        })
+        
+        # 更新状态
+        new_state["status"] = "chitchat_responded"
+        
+        # 记录日志
+        logger.info(f"生成闲聊回复: '{reply[:50]}...'")
+    
+    except Exception as e:
+        # 处理错误
+        error_message = f"生成闲聊回复时出错: {str(e)}"
+        
+        # 添加一个通用回复
+        new_state["messages"].append({
+            "role": "ai",
+            "content": "抱歉，我现在无法正确理解您的意思。请问您能换种方式表达吗？"
+        })
+        
+        # 设置错误状态
+        new_state["error"] = error_message
+        new_state["status"] = "chitchat_error"
+        
+        # 记录日志
+        logger.error(error_message)
+    
+    return new_state
+
+async def help_handler(state: EnhancedAgentState) -> EnhancedAgentState:
+    """处理帮助意图"""
+    # 复制状态
+    new_state = state.copy()
+    
+    # 准备帮助信息
+    help_text = """
+    我可以帮助您完成以下任务:
+    
+    1. 计算: 我可以计算数学表达式，例如 "计算 (3 + 4) * 5"
+    
+    2. 天气查询: 我可以查询城市的天气信息，例如 "北京今天天气怎么样？"
+    
+    3. 翻译: 我可以将文本翻译为不同语言，例如 "把'你好'翻译成英语"
+    
+    4. 业务报表:
+       - 财务报表: "生成上个季度的财务报表"
+       - 项目报表: "查看项目XYZ的进度报表"
+       - 销售报表: "显示本月销售报表"
+       - 人力资源报表: "生成部门人员配置报表"
+    
+    如果您有其他问题，请直接询问，我将尽力帮助您！
+    """
+    
+    # 添加帮助信息到消息历史
+    new_state["messages"].append({
+        "role": "ai",
+        "content": help_text
+    })
     
     # 更新状态
-    state["status"] = "updated"
+    new_state["status"] = "help_provided"
     
-    return state
+    # 记录日志
+    logger.info("已提供帮助信息")
+    
+    return new_state
+
+async def fallback_handler(state: EnhancedAgentState) -> EnhancedAgentState:
+    """处理未识别意图的回退处理"""
+    # 复制状态
+    new_state = state.copy()
+    
+    # 获取最新的用户消息
+    user_message = None
+    for msg in reversed(new_state["messages"]):
+        if msg.get("role") == "human":
+            user_message = msg.get("content", "")
+            break
+    
+    if not user_message:
+        # 如果没有找到用户消息
+        new_state["messages"].append({
+            "role": "ai",
+            "content": "抱歉，我不太理解您的意思。请问您能换个方式表达吗？或者您可以尝试以下功能：计算、天气查询、翻译或查询报表。"
+        })
+        new_state["status"] = "fallback_responded"
+        return new_state
+    
+    try:
+        # 使用LLM生成通用回复
+        llm = get_llm(temperature=0.3)
+        
+        # 准备系统提示
+        system_prompt = """
+        你是一个助手，用户的请求不在你的主要功能范围内。请礼貌地回应，并引导用户使用你的核心功能。
+        
+        你的核心功能包括：
+        1. 计算数学表达式
+        2. 查询天气信息
+        3. 文本翻译
+        4. 生成业务报表（财务、项目、销售、人力资源）
+        
+        提供友好、有帮助的回复，并简要介绍你的核心功能。
+        """
+        
+        # 准备消息
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ]
+        
+        # 请求LLM
+        response = await llm.ainvoke(messages)
+        
+        # 添加回复到消息历史
+        new_state["messages"].append({
+            "role": "ai",
+            "content": response.content
+        })
+        
+        # 更新状态
+        new_state["status"] = "fallback_responded"
+        
+        # 记录日志
+        logger.info(f"生成回退回复: '{response.content[:50]}...'")
+    
+    except Exception as e:
+        # 处理错误
+        error_message = f"生成回退回复时出错: {str(e)}"
+        
+        # 添加一个通用回复
+        new_state["messages"].append({
+            "role": "ai",
+            "content": "抱歉，我现在无法正确处理您的请求。请尝试使用我的核心功能：计算、天气查询、翻译或查询报表。"
+        })
+        
+        # 设置错误状态
+        new_state["error"] = error_message
+        new_state["status"] = "fallback_error"
+        
+        # 记录日志
+        logger.error(error_message)
+    
+    return new_state
+
+def router(state: EnhancedAgentState) -> str:
+    """路由节点
+    
+    根据当前状态和意图，决定下一步应该执行哪个节点
+    
+    Args:
+        state: 当前状态
+        
+    Returns:
+        下一个节点的名称
+    """
+    # 检查是否有错误
+    if state.get("error"):
+        logger.error(f"流程中存在错误: {state.get('error')}")
+        return "fallback_handler"
+    
+    # 获取当前意图
+    current_intent = state.get("current_intent")
+    if not current_intent:
+        logger.warning("没有识别到意图，使用 fallback 处理")
+        return "fallback_handler"
+    
+    # 获取意图名称
+    intent_name = current_intent.get("name", "")
+    
+    # 记录路由信息
+    logger.info(f"路由到意图处理器: {intent_name}")
+    
+    # 根据意图名称路由到相应的处理器
+    intent_handlers = {
+        "calculate": "calculator_handler",
+        "query_weather": "weather_handler",
+        "translate": "translate_handler",
+        "chitchat": "chitchat_handler",
+        "help": "help_handler",
+        "query_financial_report": "financial_report_handler",
+        "query_project_report": "project_report_handler",
+        "query_sales_report": "sales_report_handler",
+        "query_hr_report": "hr_report_handler",
+        "fallback": "fallback_handler"
+    }
+    
+    # 获取处理器名称，如果没有匹配则使用 fallback
+    handler = intent_handlers.get(intent_name, "fallback_handler")
+    
+    # 如果状态中指定了 next_step，并且是有效的处理器，使用它
+    if state.get("next_step") in intent_handlers.values():
+        handler = state.get("next_step")
+    
+    return handler
+
+async def update_state(state: EnhancedAgentState) -> EnhancedAgentState:
+    """更新状态，处理完成后的清理工作"""
+    # 复制状态
+    new_state = state.copy()
+    
+    # 更新时间戳
+    new_state["last_updated_at"] = datetime.now().isoformat()
+    
+    # 检查是否有错误
+    if new_state.get("error"):
+        # 如果有错误，标记为已处理
+        new_state["status"] = "error_handled"
+    else:
+        # 如果没有错误，标记为已完成
+        new_state["status"] = "completed"
+    
+    # 检查是否需要清理当前意图
+    current_intent = new_state.get("current_intent")
+    if current_intent:
+        intent_name = current_intent.get("name", "")
+        
+        # 对于一次性意图，处理完成后清除
+        one_time_intents = ["calculate", "query_weather", "translate", "help"]
+        if intent_name in one_time_intents:
+            # 保存到意图历史
+            if "intent_history" not in new_state:
+                new_state["intent_history"] = []
+            
+            # 添加完成时间
+            current_intent["completed_at"] = datetime.now().isoformat()
+            
+            # 添加到历史
+            new_state["intent_history"].append(current_intent)
+            
+            # 清除当前意图
+            new_state["current_intent"] = None
+            
+            # 记录日志
+            logger.info(f"意图已完成并清除: {intent_name}")
+    
+    # 设置下一步
+    new_state["next_step"] = "user_input_processor"
+    
+    return new_state
 
 # ============== 业务报表处理程序 ==============
 
-def report_base_handler(state: EnhancedAgentState, report_type: str) -> EnhancedAgentState:
-    """报表处理程序的基础实现"""
-    # 获取当前意图和槽位
-    current_intent = state.get("current_intent", {})
-    slots = current_intent.get("slots", {})
+async def report_base_handler(state: EnhancedAgentState, report_type: str) -> EnhancedAgentState:
+    """报表处理基础函数"""
+    # 复制状态
+    new_state = state.copy()
     
-    # 确保所有必要的槽位都已填充
-    if report_type == "financial_report":
-        required_slots = ["time_period", "report_type"]
-    elif report_type == "project_report":
-        required_slots = ["project_name", "report_aspect"]
-    elif report_type == "sales_report":
-        required_slots = ["time_period"]
-    elif report_type == "hr_report":
-        required_slots = ["report_aspect"]
-    else:
-        required_slots = []
+    # 获取槽位
+    slots = new_state.get("slots", {})
     
-    # 检查是否所有必要槽位都已填充
-    missing_slots = [slot for slot in required_slots if not slots.get(slot)]
+    # 检查必要的槽位
+    required_slots = {
+        "financial_report": ["time_period", "report_type"],
+        "project_report": ["project_id", "time_period"],
+        "sales_report": ["time_period", "product_category"],
+        "hr_report": ["department", "report_type"]
+    }
+    
+    # 获取当前报表类型的必要槽位
+    required = required_slots.get(report_type, [])
+    missing_slots = []
+    
+    for slot in required:
+        if not slots.get(slot):
+            missing_slots.append(slot)
+    
     if missing_slots:
-        # 缺少必要槽位，返回并请求填充
-        slot_name = missing_slots[0]
-        state["messages"].append({
-            "role": "assistant",
-            "content": f"请提供{slot_name}信息。"
+        # 如果有缺失的槽位
+        slot_prompts = {
+            "time_period": "请指定您需要的时间段（例如：上个月、本季度、2023年）",
+            "report_type": "请指定报表类型（例如：收入报表、支出报表、利润报表）",
+            "project_id": "请提供项目ID或项目名称",
+            "product_category": "请指定产品类别",
+            "department": "请指定部门名称"
+        }
+        
+        # 构建提示消息
+        prompts = [slot_prompts.get(slot, f"请提供{slot}") for slot in missing_slots]
+        prompt_text = "\n".join([f"- {p}" for p in prompts])
+        
+        # 添加提示消息
+        new_state["messages"].append({
+            "role": "ai",
+            "content": f"为了生成{report_type.replace('_', ' ')}，我需要以下信息：\n{prompt_text}"
         })
-        state["status"] = "slot_filling"
-        return state
+        
+        # 更新状态
+        new_state["status"] = "slot_filling"
+        return new_state
     
-    # 先执行知识检索
-    state = knowledge_retriever(state)
+    # 获取检索结果
+    retrieval_results = new_state.get("retrieval_results", [])
     
-    # 处理不同类型的报表
+    # 如果没有检索结果，尝试进行检索
+    if not retrieval_results:
+        # 构建查询
+        query_parts = []
+        for slot, value in slots.items():
+            if value:
+                query_parts.append(f"{slot}: {value}")
+        
+        query = f"{report_type} {' '.join(query_parts)}"
+        
+        # 更新状态，请求检索
+        new_state["status"] = "need_retrieval"
+        new_state["next_step"] = "knowledge_retriever"
+        
+        # 记录日志
+        logger.info(f"需要检索知识: {query}")
+        
+        return new_state
+    
+    # 根据报表类型调用相应的实现
     if report_type == "financial_report":
-        return financial_report_handler_impl(state)
+        return await financial_report_handler_impl(new_state)
     elif report_type == "project_report":
-        return project_report_handler_impl(state)
+        return await project_report_handler_impl(new_state)
     elif report_type == "sales_report":
-        return sales_report_handler_impl(state)
+        return await sales_report_handler_impl(new_state)
     elif report_type == "hr_report":
-        return hr_report_handler_impl(state)
+        return await hr_report_handler_impl(new_state)
     else:
         # 未知报表类型
-        state["messages"].append({
-            "role": "assistant",
-            "content": "抱歉，我不支持这种类型的报表查询。"
-        })
-        state["status"] = "error"
-        state["error"] = f"未知报表类型: {report_type}"
-        return state
+        new_state["error"] = f"未知的报表类型: {report_type}"
+        new_state["status"] = "error"
+        return new_state
 
-def financial_report_handler(state: EnhancedAgentState) -> EnhancedAgentState:
+async def financial_report_handler(state: EnhancedAgentState) -> EnhancedAgentState:
     """处理财务报表意图"""
-    return report_base_handler(state, "financial_report")
+    return await report_base_handler(state, "financial_report")
 
-def project_report_handler(state: EnhancedAgentState) -> EnhancedAgentState:
+async def project_report_handler(state: EnhancedAgentState) -> EnhancedAgentState:
     """处理项目报表意图"""
-    return report_base_handler(state, "project_report")
+    return await report_base_handler(state, "project_report")
 
-def sales_report_handler(state: EnhancedAgentState) -> EnhancedAgentState:
+async def sales_report_handler(state: EnhancedAgentState) -> EnhancedAgentState:
     """处理销售报表意图"""
-    return report_base_handler(state, "sales_report")
+    return await report_base_handler(state, "sales_report")
 
-def hr_report_handler(state: EnhancedAgentState) -> EnhancedAgentState:
+async def hr_report_handler(state: EnhancedAgentState) -> EnhancedAgentState:
     """处理人力资源报表意图"""
-    return report_base_handler(state, "hr_report")
+    return await report_base_handler(state, "hr_report")
 
-def financial_report_handler_impl(state: EnhancedAgentState) -> EnhancedAgentState:
-    """财务报表处理程序实现"""
-    # 获取槽位值
-    slots = state["current_intent"]["slots"]
+async def financial_report_handler_impl(state: EnhancedAgentState) -> EnhancedAgentState:
+    """财务报表处理实现"""
+    # 复制状态
+    new_state = state.copy()
+    
+    # 获取槽位
+    slots = new_state.get("slots", {})
     time_period = slots.get("time_period", "")
     report_type = slots.get("report_type", "")
     
     # 获取检索结果
-    retrieval_results = state.get("retrieval_results", [])
+    retrieval_results = new_state.get("retrieval_results", [])
     
-    # 生成报表数据（模拟数据）
-    business_data = {
-        "report_type": "financial",
-        "time_period": time_period,
-        "report_subtype": report_type,
-        "data": {
-            "revenue": "1,350,000",
-            "expenses": "950,000",
-            "profit": "400,000",
-            "growth": "+12%",
-            "details": {
-                "products": "850,000",
-                "services": "500,000",
-                "operations": "550,000",
-                "marketing": "250,000",
-                "administrative": "150,000"
+    try:
+        # 构建业务数据
+        business_data = {
+            "time_period": time_period,
+            "report_type": report_type,
+            "financial_data": {
+                "revenue": {
+                    "value": 1250000,
+                    "change": 0.15,
+                    "breakdown": {
+                        "product_sales": 850000,
+                        "services": 350000,
+                        "other": 50000
+                    }
+                },
+                "expenses": {
+                    "value": 750000,
+                    "change": 0.08,
+                    "breakdown": {
+                        "operations": 400000,
+                        "marketing": 150000,
+                        "r_and_d": 120000,
+                        "admin": 80000
+                    }
+                },
+                "profit": {
+                    "value": 500000,
+                    "change": 0.25,
+                    "margin": 0.4
+                },
+                "cash_flow": {
+                    "operating": 450000,
+                    "investing": -200000,
+                    "financing": -100000,
+                    "net_change": 150000
+                }
             }
         }
-    }
-    
-    # 更新业务数据
-    state["business_data"] = business_data
-    
-    # 使用LLM生成报表响应
-    try:
-        llm = get_llm()
         
-        # 构建提示
-        system_prompt = """
-        你是一个专业的财务分析助手。请根据提供的财务数据和检索信息，生成一份简洁、专业的财务报表分析。
-        分析应包括以下内容：
-        1. 简要概述报表主要指标
-        2. 与相关时期的比较和变化趋势
-        3. 关键财务指标的解读
-        4. 结论或建议（如果适用）
+        # 使用LLM生成报表分析
+        llm = get_llm(temperature=0.2)
         
-        保持分析简洁、专业、易于理解。
+        # 准备系统提示
+        system_prompt = f"""
+        你是一位专业的财务分析师。请根据提供的财务数据生成一份专业的财务报表分析。
+        
+        时间段: {time_period}
+        报表类型: {report_type}
+        
+        财务数据:
+        {json.dumps(business_data["financial_data"], indent=2)}
+        
+        请提供以下内容:
+        1. 简短的总体财务状况概述
+        2. 关键指标分析（收入、支出、利润等）
+        3. 与上期相比的变化趋势
+        4. 值得注意的财务亮点或问题
+        5. 简短的建议或展望
+        
+        使用专业但易于理解的语言，保持分析简洁明了。
         """
         
-        # 构建检索信息
-        retrieval_info = "\n\n".join([
-            f"[检索结果 {i+1}, 相关度: {result.get('relevance', 0):.2f}]\n{result.get('content', '')}"
-            for i, result in enumerate(retrieval_results)
-        ])
+        # 准备检索结果上下文
+        context = ""
+        if retrieval_results:
+            context_items = []
+            for item in retrieval_results[:3]:  # 使用前3条检索结果
+                content = item.get("content", "")
+                source = item.get("source", "未知")
+                context_items.append(f"- {content} (来源: {source})")
+            
+            if context_items:
+                context = "相关背景信息:\n" + "\n".join(context_items)
         
-        # 构建业务数据信息
-        business_data_info = json.dumps(business_data, ensure_ascii=False, indent=2)
+        # 准备消息
+        messages = [
+            {"role": "system", "content": system_prompt}
+        ]
         
-        user_prompt = f"""
-        请根据以下信息生成一份财务报表分析：
+        if context:
+            messages.append({"role": "user", "content": context})
         
-        查询信息：
-        - 报表类型: {report_type}
-        - 时间段: {time_period}
+        # 请求LLM
+        response = await llm.ainvoke(messages)
         
-        检索信息：
-        {retrieval_info}
+        # 构建报表响应
+        report_content = response.content
         
-        报表数据：
-        {business_data_info}
-        """
-        
-        response = llm.invoke([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ])
-        
-        # 添加响应
-        state["messages"].append({
-            "role": "assistant",
-            "content": response.content
+        # 添加响应到消息历史
+        new_state["messages"].append({
+            "role": "ai",
+            "content": f"以下是{time_period}的{report_type}分析：\n\n{report_content}"
         })
+        
+        # 更新状态
+        new_state["status"] = "report_generated"
         
         # 记录日志
-        logger.info(f"生成财务报表分析，时间段: {time_period}, 类型: {report_type}")
+        logger.info(f"生成财务报表: {time_period} {report_type}")
+    
     except Exception as e:
         # 处理错误
-        error_message = f"生成财务报表分析失败: {str(e)}"
-        state["messages"].append({
-            "role": "assistant",
-            "content": f"抱歉，生成{time_period}的{report_type}报表分析时出现错误。请稍后再试。"
+        error_message = f"生成财务报表时出错: {str(e)}"
+        
+        # 添加错误消息到历史
+        new_state["messages"].append({
+            "role": "ai",
+            "content": f"抱歉，{error_message} 请稍后再试。"
         })
-        state["error"] = error_message
-        logger.error(error_message)
-    
-    # 更新状态
-    state["status"] = "processed"
-    
-    return state
-
-def project_report_handler_impl(state: EnhancedAgentState) -> EnhancedAgentState:
-    """项目报表处理程序实现"""
-    # 获取槽位值
-    slots = state["current_intent"]["slots"]
-    project_name = slots.get("project_name", "")
-    report_aspect = slots.get("report_aspect", "")
-    
-    # 获取检索结果
-    retrieval_results = state.get("retrieval_results", [])
-    
-    # 生成报表数据（模拟数据）
-    business_data = {
-        "report_type": "project",
-        "project_name": project_name,
-        "report_aspect": report_aspect,
-        "data": {
-            "completion": "65%",
-            "timeline": {
-                "start_date": "2023-01-15",
-                "planned_end_date": "2023-09-30",
-                "current_phase": "实施",
-                "next_milestone": "系统测试",
-                "next_milestone_date": "2023-07-15"
-            },
-            "resources": {
-                "team_members": "8",
-                "allocated_budget": "200万",
-                "budget_used": "120万",
-                "remaining_budget": "80万"
-            },
-            "risks": [
-                {"name": "技术挑战", "level": "中", "mitigation": "增加技术专家支持"},
-                {"name": "时间压力", "level": "高", "mitigation": "调整范围和优先级"}
-            ]
-        }
-    }
-    
-    # 更新业务数据
-    state["business_data"] = business_data
-    
-    # 使用LLM生成报表响应
-    try:
-        llm = get_llm()
         
-        # 构建提示
-        system_prompt = """
-        你是一个专业的项目管理助手。请根据提供的项目数据和检索信息，生成一份简洁、专业的项目报表分析。
-        分析应包括以下内容：
-        1. 项目当前状态概述
-        2. 具体关注方面的详细分析（进度、资源、预算或风险）
-        3. 相关建议或下一步行动
-        
-        保持分析简洁、专业、易于理解，并聚焦在用户关注的方面。
-        """
-        
-        # 构建检索信息
-        retrieval_info = "\n\n".join([
-            f"[检索结果 {i+1}, 相关度: {result.get('relevance', 0):.2f}]\n{result.get('content', '')}"
-            for i, result in enumerate(retrieval_results)
-        ])
-        
-        # 构建业务数据信息
-        business_data_info = json.dumps(business_data, ensure_ascii=False, indent=2)
-        
-        user_prompt = f"""
-        请根据以下信息生成一份项目报表分析：
-        
-        查询信息：
-        - 项目名称: {project_name}
-        - 关注方面: {report_aspect}
-        
-        检索信息：
-        {retrieval_info}
-        
-        报表数据：
-        {business_data_info}
-        """
-        
-        response = llm.invoke([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ])
-        
-        # 添加响应
-        state["messages"].append({
-            "role": "assistant",
-            "content": response.content
-        })
+        # 设置错误状态
+        new_state["error"] = error_message
+        new_state["status"] = "report_error"
         
         # 记录日志
-        logger.info(f"生成项目报表分析，项目: {project_name}, 方面: {report_aspect}")
-    except Exception as e:
-        # 处理错误
-        error_message = f"生成项目报表分析失败: {str(e)}"
-        state["messages"].append({
-            "role": "assistant",
-            "content": f"抱歉，生成{project_name}的{report_aspect}报表分析时出现错误。请稍后再试。"
-        })
-        state["error"] = error_message
         logger.error(error_message)
     
-    # 更新状态
-    state["status"] = "processed"
-    
-    return state
+    return new_state
 
-def sales_report_handler_impl(state: EnhancedAgentState) -> EnhancedAgentState:
-    """销售报表处理程序实现"""
-    # 获取槽位值
-    slots = state["current_intent"]["slots"]
+async def project_report_handler_impl(state: EnhancedAgentState) -> EnhancedAgentState:
+    """项目报表处理实现"""
+    # 复制状态
+    new_state = state.copy()
+    
+    # 获取槽位
+    slots = new_state.get("slots", {})
+    project_id = slots.get("project_id", "")
     time_period = slots.get("time_period", "")
-    product = slots.get("product", "所有产品")
     
     # 获取检索结果
-    retrieval_results = state.get("retrieval_results", [])
+    retrieval_results = new_state.get("retrieval_results", [])
     
-    # 生成报表数据（模拟数据）
-    business_data = {
-        "report_type": "sales",
-        "time_period": time_period,
-        "product": product,
-        "data": {
-            "total_sales": "480万元",
-            "growth_rate": "+6.7%",
-            "new_customers": "25",
-            "products": {
-                "产品A": {"sales": "180万元", "growth": "+3%", "units": "900"},
-                "产品B": {"sales": "150万元", "growth": "+30%", "units": "600"},
-                "产品C": {"sales": "150万元", "growth": "-5%", "units": "300"}
-            },
-            "regions": {
-                "华北": "150万元",
-                "华东": "180万元",
-                "华南": "100万元",
-                "西部": "50万元"
+    try:
+        # 构建业务数据
+        business_data = {
+            "project_id": project_id,
+            "time_period": time_period,
+            "project_data": {
+                "name": f"Project {project_id}",
+                "status": "In Progress",
+                "completion": 0.65,
+                "start_date": "2023-01-15",
+                "end_date": "2023-12-31",
+                "budget": {
+                    "total": 500000,
+                    "spent": 325000,
+                    "remaining": 175000,
+                    "burn_rate": 35000
+                },
+                "milestones": [
+                    {"name": "Planning", "status": "Completed", "completion": 1.0},
+                    {"name": "Design", "status": "Completed", "completion": 1.0},
+                    {"name": "Development", "status": "In Progress", "completion": 0.7},
+                    {"name": "Testing", "status": "In Progress", "completion": 0.3},
+                    {"name": "Deployment", "status": "Not Started", "completion": 0.0}
+                ],
+                "resources": {
+                    "team_members": 12,
+                    "allocation": {
+                        "developers": 7,
+                        "designers": 2,
+                        "managers": 1,
+                        "qa": 2
+                    }
+                },
+                "risks": [
+                    {"name": "Schedule Delay", "severity": "Medium", "mitigation": "Adding resources"},
+                    {"name": "Budget Overrun", "severity": "Low", "mitigation": "Cost monitoring"}
+                ]
             }
         }
-    }
-    
-    # 更新业务数据
-    state["business_data"] = business_data
-    
-    # 使用LLM生成报表响应
-    try:
-        llm = get_llm()
         
-        # 构建提示
-        system_prompt = """
-        你是一个专业的销售分析助手。请根据提供的销售数据和检索信息，生成一份简洁、专业的销售报表分析。
-        分析应包括以下内容：
-        1. 销售总体情况概述
-        2. 产品销售表现分析
-        3. 区域销售分布
-        4. 重要趋势和亮点
-        5. 相关建议或下一步行动
+        # 使用LLM生成报表分析
+        llm = get_llm(temperature=0.2)
         
-        如果查询的是特定产品，则重点分析该产品的销售情况。
-        保持分析简洁、专业、易于理解。
+        # 准备系统提示
+        system_prompt = f"""
+        你是一位专业的项目管理分析师。请根据提供的项目数据生成一份专业的项目报表分析。
+        
+        项目ID: {project_id}
+        时间段: {time_period}
+        
+        项目数据:
+        {json.dumps(business_data["project_data"], indent=2)}
+        
+        请提供以下内容:
+        1. 项目概述和当前状态
+        2. 进度分析（计划vs实际）
+        3. 预算使用情况
+        4. 里程碑完成情况
+        5. 资源分配情况
+        6. 风险评估
+        7. 建议和下一步行动
+        
+        使用专业但易于理解的语言，保持分析简洁明了。
         """
         
-        # 构建检索信息
-        retrieval_info = "\n\n".join([
-            f"[检索结果 {i+1}, 相关度: {result.get('relevance', 0):.2f}]\n{result.get('content', '')}"
-            for i, result in enumerate(retrieval_results)
-        ])
+        # 准备检索结果上下文
+        context = ""
+        if retrieval_results:
+            context_items = []
+            for item in retrieval_results[:3]:  # 使用前3条检索结果
+                content = item.get("content", "")
+                source = item.get("source", "未知")
+                context_items.append(f"- {content} (来源: {source})")
+            
+            if context_items:
+                context = "相关背景信息:\n" + "\n".join(context_items)
         
-        # 构建业务数据信息
-        business_data_info = json.dumps(business_data, ensure_ascii=False, indent=2)
+        # 准备消息
+        messages = [
+            {"role": "system", "content": system_prompt}
+        ]
         
-        user_prompt = f"""
-        请根据以下信息生成一份销售报表分析：
+        if context:
+            messages.append({"role": "user", "content": context})
         
-        查询信息：
-        - 时间段: {time_period}
-        - 产品: {product}
+        # 请求LLM
+        response = await llm.ainvoke(messages)
         
-        检索信息：
-        {retrieval_info}
+        # 构建报表响应
+        report_content = response.content
         
-        报表数据：
-        {business_data_info}
-        """
-        
-        response = llm.invoke([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ])
-        
-        # 添加响应
-        state["messages"].append({
-            "role": "assistant",
-            "content": response.content
+        # 添加响应到消息历史
+        new_state["messages"].append({
+            "role": "ai",
+            "content": f"以下是项目 {project_id} 在 {time_period} 的报表分析：\n\n{report_content}"
         })
+        
+        # 更新状态
+        new_state["status"] = "report_generated"
         
         # 记录日志
-        logger.info(f"生成销售报表分析，时间段: {time_period}, 产品: {product}")
+        logger.info(f"生成项目报表: 项目 {project_id}, 时间段 {time_period}")
+    
     except Exception as e:
         # 处理错误
-        error_message = f"生成销售报表分析失败: {str(e)}"
-        state["messages"].append({
-            "role": "assistant",
-            "content": f"抱歉，生成{time_period}的销售报表分析时出现错误。请稍后再试。"
+        error_message = f"生成项目报表时出错: {str(e)}"
+        
+        # 添加错误消息到历史
+        new_state["messages"].append({
+            "role": "ai",
+            "content": f"抱歉，{error_message} 请稍后再试。"
         })
-        state["error"] = error_message
+        
+        # 设置错误状态
+        new_state["error"] = error_message
+        new_state["status"] = "report_error"
+        
+        # 记录日志
         logger.error(error_message)
     
-    # 更新状态
-    state["status"] = "processed"
-    
-    return state
+    return new_state
 
-def hr_report_handler_impl(state: EnhancedAgentState) -> EnhancedAgentState:
-    """人力资源报表处理程序实现"""
-    # 获取槽位值
-    slots = state["current_intent"]["slots"]
-    report_aspect = slots.get("report_aspect", "")
-    department = slots.get("department", "所有部门")
+async def sales_report_handler_impl(state: EnhancedAgentState) -> EnhancedAgentState:
+    """销售报表处理实现"""
+    # 复制状态
+    new_state = state.copy()
+    
+    # 获取槽位
+    slots = new_state.get("slots", {})
+    region = slots.get("region", "")
+    time_period = slots.get("time_period", "")
+    product_line = slots.get("product_line", "")
     
     # 获取检索结果
-    retrieval_results = state.get("retrieval_results", [])
+    retrieval_results = new_state.get("retrieval_results", [])
     
-    # 生成报表数据（模拟数据）
-    business_data = {
-        "report_type": "hr",
-        "report_aspect": report_aspect,
-        "department": department,
-        "data": {
-            "总员工数": "500人",
-            "部门分布": {
-                "技术部": "200人",
-                "销售部": "150人",
-                "行政部": "50人",
-                "其他部门": "100人"
-            },
-            "招聘情况": {
-                "本季度新员工": "30人",
-                "技术岗位": "15人",
-                "销售岗位": "10人",
-                "行政岗位": "5人",
-                "在招岗位": "25个"
-            },
-            "离职情况": {
-                "本季度离职": "10人",
-                "离职率": "2%"
-            },
-            "培训情况": {
-                "培训次数": "15次",
-                "培训人次": "300人次",
-                "培训满意度": "4.2/5"
+    try:
+        # 构建业务数据
+        business_data = {
+            "region": region,
+            "time_period": time_period,
+            "product_line": product_line,
+            "sales_data": {
+                "total_revenue": 2450000,
+                "year_over_year_growth": 0.15,
+                "quarter_over_quarter_growth": 0.05,
+                "units_sold": 12500,
+                "average_deal_size": 196000,
+                "conversion_rate": 0.28,
+                "top_products": [
+                    {"name": "Product A", "revenue": 980000, "units": 4900},
+                    {"name": "Product B", "revenue": 735000, "units": 3750},
+                    {"name": "Product C", "revenue": 490000, "units": 2450},
+                    {"name": "Product D", "revenue": 245000, "units": 1400}
+                ],
+                "sales_channels": {
+                    "direct": 0.45,
+                    "partners": 0.30,
+                    "online": 0.25
+                },
+                "customer_segments": {
+                    "enterprise": 0.55,
+                    "mid_market": 0.30,
+                    "small_business": 0.15
+                },
+                "pipeline": {
+                    "value": 3675000,
+                    "qualified_leads": 85,
+                    "average_sales_cycle": 45
+                }
             }
         }
-    }
-    
-    # 更新业务数据
-    state["business_data"] = business_data
-    
-    # 使用LLM生成报表响应
-    try:
-        llm = get_llm()
         
-        # 构建提示
-        system_prompt = """
-        你是一个专业的人力资源分析助手。请根据提供的人力资源数据和检索信息，生成一份简洁、专业的人力资源报表分析。
-        分析应包括以下内容：
-        1. 所查询方面的总体情况概述
-        2. 相关指标的详细分析
-        3. 趋势和特点
-        4. 相关建议或改进措施
+        # 使用LLM生成报表分析
+        llm = get_llm(temperature=0.2)
         
-        如果查询的是特定部门，则重点分析该部门的情况。
-        保持分析简洁、专业、易于理解。
+        # 准备系统提示
+        system_prompt = f"""
+        你是一位专业的销售分析师。请根据提供的销售数据生成一份专业的销售报表分析。
+        
+        区域: {region}
+        时间段: {time_period}
+        产品线: {product_line}
+        
+        销售数据:
+        {json.dumps(business_data["sales_data"], indent=2)}
+        
+        请提供以下内容:
+        1. 销售业绩概述
+        2. 同比和环比增长分析
+        3. 产品表现分析
+        4. 销售渠道分析
+        5. 客户细分分析
+        6. 销售漏斗和转化率分析
+        7. 关键洞察和建议
+        
+        使用专业但易于理解的语言，保持分析简洁明了。
         """
         
-        # 构建检索信息
-        retrieval_info = "\n\n".join([
-            f"[检索结果 {i+1}, 相关度: {result.get('relevance', 0):.2f}]\n{result.get('content', '')}"
-            for i, result in enumerate(retrieval_results)
-        ])
+        # 准备检索结果上下文
+        context = ""
+        if retrieval_results:
+            context_items = []
+            for item in retrieval_results[:3]:  # 使用前3条检索结果
+                content = item.get("content", "")
+                source = item.get("source", "未知")
+                context_items.append(f"- {content} (来源: {source})")
+            
+            if context_items:
+                context = "相关背景信息:\n" + "\n".join(context_items)
         
-        # 构建业务数据信息
-        business_data_info = json.dumps(business_data, ensure_ascii=False, indent=2)
+        # 准备消息
+        messages = [
+            {"role": "system", "content": system_prompt}
+        ]
         
-        user_prompt = f"""
-        请根据以下信息生成一份人力资源报表分析：
+        if context:
+            messages.append({"role": "user", "content": context})
         
-        查询信息：
-        - 关注方面: {report_aspect}
-        - 部门: {department}
+        # 请求LLM
+        response = await llm.ainvoke(messages)
         
-        检索信息：
-        {retrieval_info}
+        # 构建报表响应
+        report_content = response.content
         
-        报表数据：
-        {business_data_info}
-        """
-        
-        response = llm.invoke([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ])
-        
-        # 添加响应
-        state["messages"].append({
-            "role": "assistant",
-            "content": response.content
+        # 添加响应到消息历史
+        new_state["messages"].append({
+            "role": "ai",
+            "content": f"以下是{region}地区{product_line}在{time_period}的销售报表分析：\n\n{report_content}"
         })
+        
+        # 更新状态
+        new_state["status"] = "report_generated"
         
         # 记录日志
-        logger.info(f"生成人力资源报表分析，方面: {report_aspect}, 部门: {department}")
+        logger.info(f"生成销售报表: 区域 {region}, 产品线 {product_line}, 时间段 {time_period}")
+    
     except Exception as e:
         # 处理错误
-        error_message = f"生成人力资源报表分析失败: {str(e)}"
-        state["messages"].append({
-            "role": "assistant",
-            "content": f"抱歉，生成{report_aspect}的人力资源报表分析时出现错误。请稍后再试。"
+        error_message = f"生成销售报表时出错: {str(e)}"
+        
+        # 添加错误消息到历史
+        new_state["messages"].append({
+            "role": "ai",
+            "content": f"抱歉，{error_message} 请稍后再试。"
         })
-        state["error"] = error_message
+        
+        # 设置错误状态
+        new_state["error"] = error_message
+        new_state["status"] = "report_error"
+        
+        # 记录日志
         logger.error(error_message)
     
-    # 更新状态
-    state["status"] = "processed"
+    return new_state
+
+async def hr_report_handler_impl(state: EnhancedAgentState) -> EnhancedAgentState:
+    """人力资源报表处理实现"""
+    # 复制状态
+    new_state = state.copy()
     
-    return state
+    # 获取槽位
+    slots = new_state.get("slots", {})
+    department = slots.get("department", "")
+    time_period = slots.get("time_period", "")
+    report_type = slots.get("report_type", "")
+    
+    # 获取检索结果
+    retrieval_results = new_state.get("retrieval_results", [])
+    
+    try:
+        # 构建业务数据
+        business_data = {
+            "department": department,
+            "time_period": time_period,
+            "report_type": report_type,
+            "hr_data": {
+                "headcount": {
+                    "total": 125,
+                    "new_hires": 15,
+                    "terminations": 8,
+                    "growth_rate": 0.06
+                },
+                "demographics": {
+                    "gender_ratio": {"male": 0.55, "female": 0.45},
+                    "age_distribution": {
+                        "20-30": 0.25,
+                        "31-40": 0.45,
+                        "41-50": 0.20,
+                        "51+": 0.10
+                    },
+                    "tenure": {
+                        "0-1 year": 0.20,
+                        "1-3 years": 0.35,
+                        "3-5 years": 0.25,
+                        "5+ years": 0.20
+                    }
+                },
+                "performance": {
+                    "average_rating": 3.7,
+                    "rating_distribution": {
+                        "5": 0.15,
+                        "4": 0.45,
+                        "3": 0.30,
+                        "2": 0.08,
+                        "1": 0.02
+                    },
+                    "promotion_rate": 0.12
+                },
+                "compensation": {
+                    "average_salary": 85000,
+                    "salary_increase": 0.04,
+                    "bonus_distribution": 0.08
+                },
+                "engagement": {
+                    "satisfaction_score": 7.8,
+                    "participation_rate": 0.85,
+                    "top_concerns": [
+                        "工作生活平衡",
+                        "职业发展",
+                        "团队协作"
+                    ]
+                },
+                "turnover": {
+                    "rate": 0.064,
+                    "voluntary_rate": 0.048,
+                    "involuntary_rate": 0.016,
+                    "top_reasons": [
+                        "职业发展机会",
+                        "薪酬",
+                        "工作环境"
+                    ]
+                }
+            }
+        }
+        
+        # 使用LLM生成报表分析
+        llm = get_llm(temperature=0.2)
+        
+        # 准备系统提示
+        system_prompt = f"""
+        你是一位专业的人力资源分析师。请根据提供的HR数据生成一份专业的人力资源报表分析。
+        
+        部门: {department}
+        时间段: {time_period}
+        报表类型: {report_type}
+        
+        HR数据:
+        {json.dumps(business_data["hr_data"], indent=2)}
+        
+        请提供以下内容:
+        1. 人员概况分析
+        2. 人口统计学分析
+        3. 绩效分析
+        4. 薪酬分析
+        5. 员工敬业度分析
+        6. 离职率分析
+        7. 关键洞察和建议
+        
+        使用专业但易于理解的语言，保持分析简洁明了。
+        """
+        
+        # 准备检索结果上下文
+        context = ""
+        if retrieval_results:
+            context_items = []
+            for item in retrieval_results[:3]:  # 使用前3条检索结果
+                content = item.get("content", "")
+                source = item.get("source", "未知")
+                context_items.append(f"- {content} (来源: {source})")
+            
+            if context_items:
+                context = "相关背景信息:\n" + "\n".join(context_items)
+        
+        # 准备消息
+        messages = [
+            {"role": "system", "content": system_prompt}
+        ]
+        
+        if context:
+            messages.append({"role": "user", "content": context})
+        
+        # 请求LLM
+        response = await llm.ainvoke(messages)
+        
+        # 构建报表响应
+        report_content = response.content
+        
+        # 添加响应到消息历史
+        new_state["messages"].append({
+            "role": "ai",
+            "content": f"以下是{department}部门在{time_period}的{report_type}人力资源报表分析：\n\n{report_content}"
+        })
+        
+        # 更新状态
+        new_state["status"] = "report_generated"
+        
+        # 记录日志
+        logger.info(f"生成HR报表: 部门 {department}, 时间段 {time_period}, 类型 {report_type}")
+    
+    except Exception as e:
+        # 处理错误
+        error_message = f"生成HR报表时出错: {str(e)}"
+        
+        # 添加错误消息到历史
+        new_state["messages"].append({
+            "role": "ai",
+            "content": f"抱歉，{error_message} 请稍后再试。"
+        })
+        
+        # 设置错误状态
+        new_state["error"] = error_message
+        new_state["status"] = "report_error"
+        
+        # 记录日志
+        logger.error(error_message)
+    
+    return new_state
 
 # ============== 图形构建 ==============
 
-# 构建图结构
-def build_graph():
-    """构建对话图"""
-    # 创建图
-    graph = StateGraph(EnhancedAgentState)
+def build_graph() -> StateGraph:
+    """构建状态图
+    
+    创建并配置代理状态图，定义各节点和边的连接关系
+    
+    Returns:
+        配置好的状态图
+    """
+    # 创建状态图
+    workflow = StateGraph(EnhancedAgentState)
     
     # 添加节点
-    graph.add_node("user_input_processor", user_input_processor)
-    graph.add_node("intent_recognizer", intent_recognizer)
-    graph.add_node("check_return_to_previous", check_return_to_previous)
-    graph.add_node("slot_filler", slot_filler)
-    graph.add_node("knowledge_retriever", knowledge_retriever)
+    workflow.add_node("user_input_processor", user_input_processor)
+    workflow.add_node("check_return_to_previous", check_return_to_previous)
+    workflow.add_node("intent_recognizer", intent_recognizer)
+    workflow.add_node("slot_filler", slot_filler)
+    workflow.add_node("knowledge_retriever", knowledge_retriever)
+    workflow.add_node("calculator_handler", calculator_handler)
+    workflow.add_node("weather_handler", weather_handler)
+    workflow.add_node("translate_handler", translate_handler)
+    workflow.add_node("chitchat_handler", chitchat_handler)
+    workflow.add_node("help_handler", help_handler)
+    workflow.add_node("fallback_handler", fallback_handler)
+    workflow.add_node("financial_report_handler", financial_report_handler)
+    workflow.add_node("project_report_handler", project_report_handler)
+    workflow.add_node("sales_report_handler", sales_report_handler) 
+    workflow.add_node("hr_report_handler", hr_report_handler)
+    workflow.add_node("router", router)
+    workflow.add_node("handle_breakpoint", handle_breakpoint)
+    workflow.add_node("process_human_input", process_human_input)
     
-    # 添加处理程序节点
-    graph.add_node("calculator_handler", calculator_handler)
-    graph.add_node("weather_handler", weather_handler)
-    graph.add_node("translate_handler", translate_handler)
-    graph.add_node("chitchat_handler", chitchat_handler)
-    graph.add_node("help_handler", help_handler)
-    graph.add_node("fallback_handler", fallback_handler)
+    # 设置入口节点
+    workflow.set_entry_point("user_input_processor")
     
-    # 添加报表处理程序节点
-    graph.add_node("financial_report_handler", financial_report_handler)
-    graph.add_node("project_report_handler", project_report_handler)
-    graph.add_node("sales_report_handler", sales_report_handler)
-    graph.add_node("hr_report_handler", hr_report_handler)
+    # 定义条件函数
+    def should_check_return(state: EnhancedAgentState) -> bool:
+        """检查是否需要检查返回到之前的话题"""
+        return len(state.get("suspended_intents", [])) > 0
     
-    # 添加状态更新节点
-    graph.add_node("update_state", update_state)
+    def should_handle_breakpoint(state: EnhancedAgentState) -> bool:
+        """检查是否需要处理断点"""
+        return state.get("human_input_required", False)
     
-    # 添加断点和人机交互节点
-    graph.add_node("check_pause", lambda state: state)  # 检查断点
-    graph.add_node("handle_breakpoint", handle_breakpoint)  # 处理断点
-    graph.add_node("process_human_input", process_human_input)  # 处理人工输入
+    def needs_human_input(state: EnhancedAgentState) -> bool:
+        """检查是否需要等待人工输入"""
+        return state.get("status") == "awaiting_human_input"
     
-    # 添加条件边
-    # 起始 -> 检查断点
-    graph.set_entry_point("check_pause")
+    def needs_slot_filling(state: EnhancedAgentState) -> bool:
+        """检查是否需要填充槽位"""
+        return state.get("status") in ["slot_filling", "slots_partially_filled", "awaiting_slot"]
     
-    # 检查断点 -> 路由
-    graph.add_conditional_edges(
-        "check_pause",
+    def is_awaiting_intent_confirmation(state: EnhancedAgentState) -> bool:
+        """检查是否需要确认意图"""
+        return state.get("status") == "need_confirmation"
+    
+    # 添加边
+    # 用户输入处理器 -> 检查返回到之前的话题或意图识别
+    workflow.add_conditional_edges(
+        "user_input_processor",
+        should_check_return,
         {
-            "handle_breakpoint": should_pause,
-            "process_human_input": lambda state: state.get("human_input") is not None,
-            "user_input_processor": lambda state: True  # 默认情况
+            True: "check_return_to_previous",
+            False: "intent_recognizer"
         }
     )
     
-    # 处理断点 -> 结束
-    graph.add_edge("handle_breakpoint", END)
+    # 检查返回到之前的话题 -> 意图识别或下一步
+    workflow.add_conditional_edges(
+        "check_return_to_previous",
+        lambda state: state.get("next_step") != "intent_recognizer",
+        {
+            True: "slot_filler",  # 已恢复意图，继续填充槽位
+            False: "intent_recognizer"  # 未恢复意图，继续意图识别
+        }
+    )
     
-    # 处理人工输入 -> 检查断点
-    graph.add_edge("process_human_input", "check_pause")
-    
-    # 用户输入处理 -> 检查返回
-    graph.add_edge("user_input_processor", "check_return_to_previous")
-    
-    # 检查返回 -> 意图识别
-    graph.add_edge("check_return_to_previous", "intent_recognizer")
-    
-    # 意图识别 -> 路由
-    graph.add_conditional_edges(
+    # 意图识别 -> 路由或槽位填充
+    workflow.add_conditional_edges(
         "intent_recognizer",
+        lambda state: state.get("status") == "intent_recognized" and not needs_slot_filling(state),
         {
-            "slot_filler": lambda state: state.get("current_intent") and state.get("status") != "slots_filled",
-            "calculator_handler": lambda state: state.get("current_intent", {}).get("name") == "calculate" and state.get("status") == "slots_filled",
-            "weather_handler": lambda state: state.get("current_intent", {}).get("name") == "query_weather" and state.get("status") == "slots_filled",
-            "translate_handler": lambda state: state.get("current_intent", {}).get("name") == "translate" and state.get("status") == "slots_filled",
-            "chitchat_handler": lambda state: state.get("current_intent", {}).get("name") == "chitchat",
-            "help_handler": lambda state: state.get("current_intent", {}).get("name") == "help",
-            "financial_report_handler": lambda state: state.get("current_intent", {}).get("name") == "query_financial_report" and state.get("status") == "slots_filled",
-            "project_report_handler": lambda state: state.get("current_intent", {}).get("name") == "query_project_report" and state.get("status") == "slots_filled",
-            "sales_report_handler": lambda state: state.get("current_intent", {}).get("name") == "query_sales_report" and state.get("status") == "slots_filled",
-            "hr_report_handler": lambda state: state.get("current_intent", {}).get("name") == "query_hr_report" and state.get("status") == "slots_filled",
-            "fallback_handler": lambda state: True  # 默认情况
+            True: "router",  # 意图已识别且不需要槽位填充
+            False: "slot_filler"  # 需要填充槽位
         }
     )
     
-    # 槽位填充 -> 路由
-    graph.add_conditional_edges(
+    # 槽位填充 -> 路由或继续填充
+    workflow.add_conditional_edges(
         "slot_filler",
+        lambda state: state.get("status") == "slots_filled",
         {
-            "slot_filler": lambda state: state.get("status") == "slot_filling",
-            "calculator_handler": lambda state: state.get("current_intent", {}).get("name") == "calculate" and state.get("status") == "slots_filled",
-            "weather_handler": lambda state: state.get("current_intent", {}).get("name") == "query_weather" and state.get("status") == "slots_filled",
-            "translate_handler": lambda state: state.get("current_intent", {}).get("name") == "translate" and state.get("status") == "slots_filled",
-            "financial_report_handler": lambda state: state.get("current_intent", {}).get("name") == "query_financial_report" and state.get("status") == "slots_filled",
-            "project_report_handler": lambda state: state.get("current_intent", {}).get("name") == "query_project_report" and state.get("status") == "slots_filled",
-            "sales_report_handler": lambda state: state.get("current_intent", {}).get("name") == "query_sales_report" and state.get("status") == "slots_filled",
-            "hr_report_handler": lambda state: state.get("current_intent", {}).get("name") == "query_hr_report" and state.get("status") == "slots_filled",
-            "intent_recognizer": lambda state: True  # 默认回到意图识别
+            True: "router",  # 所有槽位已填充
+            False: "slot_filler"  # 继续填充槽位
         }
     )
     
-    # 所有处理程序 -> 状态更新
-    handlers = [
-        "calculator_handler", "weather_handler", "translate_handler", 
+    # 所有处理节点 -> 结束
+    for handler in [
+        "calculator_handler", "weather_handler", "translate_handler",
         "chitchat_handler", "help_handler", "fallback_handler",
-        "financial_report_handler", "project_report_handler", 
+        "financial_report_handler", "project_report_handler",
         "sales_report_handler", "hr_report_handler"
-    ]
+    ]:
+        workflow.add_edge(handler, END)
     
-    for handler in handlers:
-        graph.add_edge(handler, "update_state")
+    # 路由到各处理器
+    workflow.add_router("router", router)
     
-    # 主线处理完成后 -> 检查断点
-    graph.add_edge("update_state", "check_pause")
-    
-    # 知识检索器添加
-    graph.add_edge("knowledge_retriever", "update_state")
-    
-    return graph
+    # 编译图
+    return workflow.compile()
 
 # 创建图
 compiled_graph = build_graph()
@@ -1778,8 +2331,31 @@ def should_pause(state: EnhancedAgentState) -> bool:
     
     # 检查置信度
     if state["confidence"] < 0.7 and state.get("status") not in ["waiting_for_human", "processing_human_input"]:
-        logger.info(f"置信度低于阈值: {state['confidence']}")
+        logger.info(f"置信度低于阈值({state['confidence']}), 当前状态: {state['status']}")
         return True
+    
+    # 检查错误状态
+    if state.get("error") and state.get("status") != "error_handled":
+        logger.info(f"发现错误, 暂停执行: {state.get('error')}")
+        return True
+    
+    # 特殊条件检查
+    current_intent = state.get("current_intent", {})
+    if current_intent:
+        intent_name = current_intent.get("name", "")
+        
+        # 对于某些高风险操作，需要人工确认
+        high_risk_intents = ["delete_data", "modify_critical_settings", "approve_large_transaction"]
+        if intent_name in high_risk_intents:
+            logger.info(f"高风险意图需要人工确认: {intent_name}")
+            return True
+        
+        # 对于报表生成，检查是否有足够的检索结果
+        if "report" in intent_name and state.get("status") == "knowledge_retrieved":
+            retrieval_results = state.get("retrieval_results", [])
+            if len(retrieval_results) < 2:  # 至少需要2条结果
+                logger.info(f"报表生成检索结果不足({len(retrieval_results)}), 可能需要人工干预")
+                return True
     
     return False
 
@@ -1932,93 +2508,70 @@ async def astream_message(session_id: str, message: str) -> AsyncIterator[Dict[s
     # 返回完成状态
     yield {"content": "[DONE]", "session_id": session_id}
 
-# 异步处理消息
 async def aprocess_message(session_id: str, message: str) -> Dict[str, Any]:
-    """异步处理消息"""
-    # 获取会话状态
-    session_state = await get_or_create_session_state(session_id)
+    """异步处理用户消息
     
-    # 创建图实例
-    checkpointer = get_checkpointer()
-    graph = build_graph()
-    compiled_graph = graph.compile(checkpointer=checkpointer)
+    处理用户输入的消息，执行对话代理的完整流程
     
-    # 添加用户消息
-    user_message = {"role": "human", "content": message}
-    session_state["messages"].append(user_message)
-    session_state["last_updated_at"] = datetime.now().isoformat()
-    
-    # 如果需要人工输入，将消息作为人工输入处理
-    if session_state.get("human_input_required"):
-        session_state["human_input"] = message
-    
-    # 异步处理
-    config = {"configurable": {"thread_id": session_id}}
-    result = await compiled_graph.ainvoke(session_state, config)
-    
-    # 更新会话状态
-    SESSION_STATES[session_id] = result
-    
-    # 提取响应
-    messages = result.get("messages", [])
-    response = ""
-    if messages and len(messages) > 0:
-        latest_message = messages[-1]
-        if isinstance(latest_message, dict) and latest_message.get("role") == "ai":
-            response = latest_message.get("content", "")
-    
-    # 构建返回结果
-    return {
-        "response": response,
-        "completed": not result.get("human_input_required", False),
-        "metadata": {
-            "status": result.get("status", ""),
-            "current_intent": result.get("current_intent", {}).get("name") if result.get("current_intent") else None,
-            "confidence": result.get("confidence", 0)
+    Args:
+        session_id: 会话ID
+        message: 用户消息
+        
+    Returns:
+        处理结果，包括会话状态和响应消息
+    """
+    try:
+        # 获取会话状态
+        state = SESSION_STATES.get(session_id)
+        
+        # 如果没有会话状态，初始化
+        if not state:
+            state = initialize_state()
+            state["session_id"] = session_id
+            state["created_at"] = datetime.now().isoformat()
+            logger.info(f"初始化新会话: {session_id}")
+        
+        # 更新最后活动时间
+        state["last_updated_at"] = datetime.now().isoformat()
+        
+        # 添加用户消息到历史
+        state["messages"].append({
+            "role": "human",
+            "content": message,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        # 使用已编译的图执行一次完整流程
+        state = await compiled_graph.ainvoke(state)
+        
+        # 获取最后一条助手消息
+        last_assistant_message = None
+        for msg in reversed(state["messages"]):
+            if msg.get("role") in ["assistant", "ai"]:
+                last_assistant_message = msg.get("content", "")
+                break
+        
+        if not last_assistant_message:
+            last_assistant_message = "抱歉，我无法处理您的请求。"
+        
+        # 保存会话状态
+        await save_session_state(session_id, state)
+        
+        # 返回处理结果
+        return {
+            "session_id": session_id,
+            "message": last_assistant_message,
+            "state": state
         }
-    }
-
-# 获取或创建会话状态
-async def get_or_create_session_state(session_id: str) -> EnhancedAgentState:
-    """获取或创建会话状态"""
-    # 检查内存缓存
-    if session_id in SESSION_STATES:
-        return SESSION_STATES[session_id]
-    
-    # 尝试从持久化存储加载
-    checkpointer = get_checkpointer()
-    try:
-        state = await checkpointer.get(session_id)
-        if state:
-            SESSION_STATES[session_id] = state
-            return state
+        
     except Exception as e:
-        logger.warning(f"从持久化存储加载会话状态失败: {str(e)}")
-    
-    # 创建新会话
-    new_state = create_initial_state()
-    new_state["session_id"] = session_id
-    SESSION_STATES[session_id] = new_state
-    return new_state
-
-# 异步获取会话状态
-async def get_session_state(session_id: str) -> Optional[EnhancedAgentState]:
-    """异步获取会话状态"""
-    # 检查内存缓存
-    if session_id in SESSION_STATES:
-        return SESSION_STATES[session_id]
-    
-    # 尝试从持久化存储加载
-    checkpointer = get_checkpointer()
-    try:
-        state = await checkpointer.get(session_id)
-        if state:
-            SESSION_STATES[session_id] = state
-            return state
-    except Exception as e:
-        logger.warning(f"从持久化存储加载会话状态失败: {str(e)}")
-    
-    return None
+        logger.error(f"处理消息时出错: {str(e)}", exc_info=True)
+        # 返回错误信息
+        return {
+            "session_id": session_id,
+            "message": f"处理您的消息时出现错误: {str(e)}",
+            "error": str(e)
+        }
 
 # 同步处理消息（用于向后兼容）
 def process_message(session_id: str, message: str) -> Dict[str, Any]:
@@ -2030,5 +2583,91 @@ def process_message(session_id: str, message: str) -> Dict[str, Any]:
 # 导出代理
 agent = {
     "process_message": process_message,
+    "aprocess_message": aprocess_message,
     "compiled_graph": compiled_graph
 } 
+
+async def save_session_state(session_id: str, state: Dict[str, Any]) -> None:
+    """保存会话状态到持久化存储
+    
+    Args:
+        session_id: 会话ID
+        state: 会话状态
+    """
+    try:
+        # 更新内存缓存
+        SESSION_STATES[session_id] = state
+        
+        # 尝试保存到持久化存储
+        checkpointer = get_checkpointer()
+        await checkpointer.put(session_id, state)
+        logger.debug(f"会话状态已保存: {session_id}")
+    except Exception as e:
+        logger.error(f"保存会话状态失败: {str(e)}")
+        # 即使保存失败，我们仍然保留内存中的状态
+
+def check_explicit_intent(user_message: str) -> Optional[str]:
+    """检查用户是否明确指定了意图
+    
+    检查用户消息中是否包含明确的意图指令，如"我想查询天气"
+    
+    Args:
+        user_message: 用户消息
+        
+    Returns:
+        识别出的意图名称，如果没有明确指定则返回None
+    """
+    # 定义意图关键词映射
+    intent_keywords = {
+        "计算": "calculate",
+        "算一下": "calculate",
+        "计算器": "calculate",
+        "天气": "query_weather",
+        "查询天气": "query_weather",
+        "天气预报": "query_weather",
+        "翻译": "translate",
+        "帮我翻译": "translate",
+        "聊天": "chitchat",
+        "帮助": "help",
+        "使用帮助": "help",
+        "财务报表": "query_financial_report",
+        "财务报告": "query_financial_report",
+        "项目报表": "query_project_report",
+        "项目报告": "query_project_report",
+        "销售报表": "query_sales_report",
+        "销售报告": "query_sales_report",
+        "人力资源报表": "query_hr_report",
+        "人员报表": "query_hr_report",
+        "HR报表": "query_hr_report"
+    }
+    
+    # 清理用户消息
+    cleaned_message = user_message.lower().strip()
+    
+    # 检查是否有明确的意图指示
+    # 1. 检查是否有"我想要..."格式
+    explicit_patterns = [
+        r"我想要(.*)",
+        r"我需要(.*)",
+        r"我想(.*)",
+        r"请帮我(.*)",
+        r"请(.*)",
+        r"帮我(.*)"
+    ]
+    
+    for pattern in explicit_patterns:
+        match = re.search(pattern, cleaned_message)
+        if match:
+            action = match.group(1).strip()
+            # 检查操作是否匹配意图关键词
+            for keyword, intent in intent_keywords.items():
+                if keyword in action:
+                    return intent
+    
+    # 2. 直接检查关键词
+    for keyword, intent in intent_keywords.items():
+        if keyword in cleaned_message:
+            return intent
+    
+    # 没有找到明确的意图
+    return None
